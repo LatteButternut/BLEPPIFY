@@ -254,10 +254,17 @@ export async function sendPasswordResetEmailLink(
   const configured = await initSupabaseRuntimeConfig();
   if (configured) {
     try {
-      const redirectTo =
-        typeof window !== 'undefined'
-          ? `${window.location.origin}/?reset_password=1`
-          : undefined;
+      // Use a fixed public URL (e.g. https://bleppify.vercel.app) so the emailed link never
+      // points at a Vercel deployment/alias URL that contains your account or team name.
+      const configuredSiteUrl = (
+        (import.meta.env.VITE_PUBLIC_SITE_URL as string | undefined) || ''
+      )
+        .trim()
+        .replace(/\/+$/, '');
+      const siteOrigin =
+        configuredSiteUrl ||
+        (typeof window !== 'undefined' ? window.location.origin : '');
+      const redirectTo = siteOrigin ? `${siteOrigin}/?reset_password=1` : undefined;
       const { error } = await supabase.auth.resetPasswordForEmail(
         normalizedEmail,
         redirectTo ? { redirectTo } : undefined
