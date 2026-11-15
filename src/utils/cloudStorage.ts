@@ -348,3 +348,7 @@ export async function deleteCloudAccountAndData(
   return { ok: true };
 }
 
+const { error: upsertErr } = await supabase
+  .from('user_data')
+  .upsert({ user_id: userId, data: payloadState }, { onConflict: 'user_id' });
+if (upsertErr) console.error('[user_data upsert failed]', upsertErr);
