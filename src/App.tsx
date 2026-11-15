@@ -2,16 +2,6 @@
  * @license
  * SPDX-License-Identifier: Apache-2.0
  */
-const handleSignOut = async () => {
-  if (isHydratedRef.current) {
-    await saveCloudAppState(
-      { ...latestStateRef.current, updatedAt: Date.now() },
-      activeUserId
-    );
-  }
-  isHydratedRef.current = false;
-  setIsCloudHydrated(false);
-  // ...rest unchanged
 
 import React, { useState, useEffect, useRef } from 'react';
 import type { Session } from '@supabase/supabase-js';
@@ -354,10 +344,12 @@ export default function App() {
     setIsCloudHydrated(false);
 
     const storageKey = getScopedLocalStorageKey(activeUserId);
+    let cachedState: Partial<CloudAppState> | null = null;
     try {
       const cachedRaw = localStorage.getItem(storageKey);
       if (cachedRaw) {
         const parsed = JSON.parse(cachedRaw) as Partial<CloudAppState>;
+        cachedState = parsed;
         setCloudState((prev) => hydrateNormalizedState(parsed, prev.theme || 'light'));
       } else {
         setCloudState((prev) => createDefaultCloudState(prev.theme || 'light'));
@@ -369,7 +361,9 @@ export default function App() {
     loadCloudAppState(activeUserId)
       .then((loaded) => {
         if (!mounted) return;
-        if (loaded) {
+        // Only replace the local cache if the loaded copy is at least as new,
+        // so a stale server/IndexedDB copy can't overwrite newer profile edits.
+        if (loaded && (loaded.updatedAt || 0) >= (cachedState?.updatedAt || 0)) {
           setCloudState((prev) => hydrateNormalizedState(loaded, prev.theme || 'light'));
         }
         isHydratedRef.current = true;
@@ -408,7 +402,11 @@ export default function App() {
     }
 
     const timer = window.setTimeout(() => {
-      void saveCloudAppState(cloudState, activeUserId);
+      void saveCloudAppState(cloudState, activeUserId).then((ok) => {
+        if (!ok) {
+          console.warn('[BLEPPIFY] Cloud save did not reach Supabase; see errors above.');
+        }
+      });
     }, 300);
 
     return () => window.clearTimeout(timer);
@@ -493,6 +491,17 @@ export default function App() {
   };
 
   const handleSignOut = async () => {
+    // Flush any pending (debounced) changes before the session is torn down
+    if (isHydratedRef.current && activeUserId) {
+      try {
+        await saveCloudAppState(
+          { ...latestStateRef.current, updatedAt: Date.now() },
+          activeUserId
+        );
+      } catch {
+        // Continue sign-out even if the final save fails
+      }
+    }
     isHydratedRef.current = false;
     setIsCloudHydrated(false);
     if (isSupabaseConfigured && session) {
