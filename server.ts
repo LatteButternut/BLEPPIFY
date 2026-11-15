@@ -36,6 +36,44 @@ function getGeminiClient(timeoutMs = 30000): GoogleGenAI {
   });
 }
 
+// ============================================================================
+// AI provider selection: Groq (OpenAI-compatible API) or Gemini
+//   - AI_PROVIDER=groq | gemini   (optional; default = groq when GROQ_API_KEY is set, else gemini)
+//   - GROQ_API_KEY                (from https://console.groq.com/keys)
+//   - GROQ_TEXT_MODELS / GROQ_VISION_MODELS  (optional comma-separated model IDs, tried in order)
+//   - GROQ_PDF_CONTEXT_CHARS      (optional, max characters of PDF excerpts per request, default 7000)
+//   - GROQ_MAX_CONCURRENCY        (optional, parallel Groq requests per server instance, default 2)
+// ============================================================================
+type AiProviderName = 'groq' | 'gemini';
+
+interface AiClient {
+  provider: AiProviderName;
+  timeoutMs: number;
+  gemini?: GoogleGenAI;
+}
+
+function getGroqApiKey(): string {
+  return (process.env.GROQ_API_KEY || process.env.GROQ_API_KEY_ || '').trim();
+}
+
+function getActiveProvider(): AiProviderName {
+  const preferred = (process.env.AI_PROVIDER || '').trim().toLowerCase();
+  if (preferred === 'gemini') return 'gemini';
+  if (preferred === 'groq') return 'groq';
+  return getGroqApiKey() ? 'groq' : 'gemini';
+}
+
+function getAiClient(timeoutMs = 30000): AiClient {
+  const provider = getActiveProvider();
+  if (provider === 'groq') {
+    if (!getGroqApiKey()) {
+      throw new Error('Server GROQ_API_KEY is not configured.');
+    }
+    return { provider, timeoutMs };
+  }
+  return { provider, timeoutMs, gemini: getGeminiClient(timeoutMs) };
+}
+
 type PartInput =
   | { text: string }
   | { inlineData: { mimeType: string; data: string } }
@@ -123,9 +161,91 @@ async function getOrUploadGeminiPdfHandle(
   return resolved;
 }
 
+// ----------------------------------------------------------------------------
+// PDF text extraction for Groq (Groq chat models cannot read PDF files directly)
+// ----------------------------------------------------------------------------
+const pdfTextCacheByHash = new Map<string, Promise<string>>();
+
+async function extractPdfText(base64Data: string): Promise<string> {
+  const hash = hashBase64(base64Data);
+  const cached = pdfTextCacheByHash.get(hash);
+  if (cached) return cached;
+
+  const task = (async (): Promise<string> => {
+    try {
+      const { extractText, getDocumentProxy } = await import('unpdf');
+      const bytes = new Uint8Array(Buffer.from(base64Data, 'base64'));
+      const pdf = await getDocumentProxy(bytes);
+      const { text } = await extractText(pdf, { mergePages: true });
+      const joined = Array.isArray(text) ? text.join('\n') : String(text || '');
+      return joined.replace(/\s+/g, ' ').trim();
+    } catch (err) {
+      console.warn('[BLEPPIFY] PDF text extraction failed:', err instanceof Error ? err.message : err);
+      return '';
+    }
+  })();
+
+  pdfTextCacheByHash.set(hash, task);
+  const text = await task;
+  if (!text) pdfTextCacheByHash.delete(hash);
+  return text;
+}
+
+const EXCERPT_STOPWORDS = new Set([
+  'with', 'that', 'this', 'from', 'their', 'there', 'which', 'about', 'into', 'also', 'such', 'than',
+  'then', 'them', 'these', 'those', 'have', 'been', 'were', 'will', 'would', 'should', 'could', 'items',
+  'item', 'section', 'competency', 'competencies', 'bloom', 'remembering', 'understanding', 'applying',
+  'analyzing', 'evaluating', 'creating', 'subject', 'scope', 'primary', 'spotlight', 'worker', 'allowed',
+]);
+
+/** Picks the PDF passages that best match the requested competencies so the prompt stays small. */
+function selectPdfExcerpts(text: string, query: string, maxChars: number): string {
+  const clean = text.replace(/\s+/g, ' ').trim();
+  if (!clean) return '';
+  if (clean.length <= maxChars) return clean;
+
+  const CHUNK_SIZE = 1100;
+  const CHUNK_STEP = 900;
+  const chunks: Array<{ idx: number; text: string; score: number }> = [];
+  for (let i = 0, n = 0; i < clean.length; i += CHUNK_STEP, n++) {
+    chunks.push({ idx: n, text: clean.slice(i, i + CHUNK_SIZE), score: 0 });
+  }
+
+  const terms = Array.from(
+    new Set((query.toLowerCase().match(/[a-z][a-z-]{3,}/g) || []).filter((w) => !EXCERPT_STOPWORDS.has(w)))
+  );
+  if (terms.length > 0) {
+    for (const chunk of chunks) {
+      const lower = chunk.text.toLowerCase();
+      let score = 0;
+      for (const term of terms) {
+        const first = lower.indexOf(term);
+        if (first !== -1) {
+          score += 1;
+          if (lower.indexOf(term, first + term.length) !== -1) score += 0.5;
+        }
+      }
+      chunk.score = score;
+    }
+  }
+
+  const ranked = [...chunks].sort((a, b) => b.score - a.score || a.idx - b.idx);
+  const picked: typeof chunks = [];
+  let used = 0;
+  for (const chunk of ranked) {
+    if (used + chunk.text.length > maxChars) continue;
+    picked.push(chunk);
+    used += chunk.text.length;
+    if (used >= maxChars - 200) break;
+  }
+  picked.sort((a, b) => a.idx - b.idx);
+  return picked.map((c) => c.text).join('\n…\n');
+}
+
 async function resolvePdfParts(
-  ai: GoogleGenAI,
-  pdfFiles: Array<{ id?: string; name?: string; mimeType?: string; base64Data?: string }>
+  ai: AiClient,
+  pdfFiles: Array<{ id?: string; name?: string; mimeType?: string; base64Data?: string }>,
+  query = ''
 ): Promise<{ parts: PartInput[]; missingIds: string[] }> {
   if (!Array.isArray(pdfFiles) || pdfFiles.length === 0) {
     return { parts: [], missingIds: [] };
@@ -171,9 +291,32 @@ async function resolvePdfParts(
     return { parts: [], missingIds };
   }
 
+  if (ai.provider === 'groq') {
+    const budget = Math.max(1500, Number(process.env.GROQ_PDF_CONTEXT_CHARS) || 7000);
+    const perPdfBudget = Math.floor(budget / Math.max(1, resolvedEntries.length));
+    const excerpts: string[] = [];
+    for (const entry of resolvedEntries) {
+      const fullText = await extractPdfText(entry.base64Data);
+      const excerpt = selectPdfExcerpts(fullText, query, perPdfBudget);
+      if (excerpt) excerpts.push(excerpt);
+    }
+    if (excerpts.length === 0) {
+      return { parts: [], missingIds: [] };
+    }
+    return {
+      parts: [
+        {
+          text: `REFERENCE EXCERPTS FROM THE STUDENT'S UPLOADED PDF REVIEWER (only the most relevant passages are included; the full PDF is not attached):\n${excerpts.join('\n\n=== NEXT PDF ===\n')}\n--- END OF PDF EXCERPTS ---`,
+        },
+      ],
+      missingIds: [],
+    };
+  }
+
+  const geminiClient = ai.gemini as GoogleGenAI;
   const parts = await Promise.all(
     resolvedEntries.map(async (entry): Promise<PartInput> => {
-      const handle = await getOrUploadGeminiPdfHandle(ai, entry.mimeType, entry.base64Data);
+      const handle = await getOrUploadGeminiPdfHandle(geminiClient, entry.mimeType, entry.base64Data);
       if (handle) {
         return {
           fileData: {
@@ -194,12 +337,319 @@ async function resolvePdfParts(
   return { parts, missingIds: [] };
 }
 
-async function generateWithFallback(
-  ai: GoogleGenAI,
+// ----------------------------------------------------------------------------
+// Groq helpers
+// ----------------------------------------------------------------------------
+const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
+
+function parseModelList(envValue: string | undefined, fallback: string[]): string[] {
+  const list = (envValue || '')
+    .split(',')
+    .map((m) => m.trim())
+    .filter(Boolean);
+  return list.length > 0 ? list : fallback;
+}
+
+// Groq's free plan meters tokens per minute PER MODEL, so rotating across models also spreads the load.
+function getGroqTextModels(): string[] {
+  return parseModelList(process.env.GROQ_TEXT_MODELS, [
+    'openai/gpt-oss-120b',
+    'qwen/qwen3.8-27b',
+    'openai/gpt-oss-20b',
+  ]);
+}
+
+function getGroqVisionModels(): string[] {
+  return parseModelList(process.env.GROQ_VISION_MODELS, [
+    'qwen/qwen3.8-27b',
+    'qwen/qwen3.6-27b',
+    'meta-models/muse-spark-open',
+  ]);
+}
+
+function groqReasoningEffortFor(model: string): string | undefined {
+  // Reasoning tokens count toward output/TPM, so keep them minimal. Only send the field to models that accept it.
+  if (model.startsWith('openai/gpt-oss')) return 'low';
+  if (model.startsWith('qwen/qwen3.8')) return 'none';
+  return undefined;
+}
+
+class GroqHttpError extends Error {
+  status: number;
+  retryAfterSec: number | null;
+  constructor(message: string, status: number, retryAfterSec: number | null = null) {
+    super(message);
+    this.name = 'GroqHttpError';
+    this.status = status;
+    this.retryAfterSec = retryAfterSec;
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+let groqActiveRequests = 0;
+const groqWaiters: Array<() => void> = [];
+
+async function withGroqSlot<T>(fn: () => Promise<T>): Promise<T> {
+  const limit = Math.max(1, Number(process.env.GROQ_MAX_CONCURRENCY) || 2);
+  if (groqActiveRequests >= limit) {
+    // The slot is handed over directly by the request that finishes, so the counter stays accurate
+    await new Promise<void>((resolve) => groqWaiters.push(resolve));
+  } else {
+    groqActiveRequests++;
+  }
+  try {
+    return await fn();
+  } finally {
+    const next = groqWaiters.shift();
+    if (next) {
+      next();
+    } else {
+      groqActiveRequests--;
+    }
+  }
+}
+
+/**
+ * Converts a Gemini-style response schema (Type.OBJECT / Type.ARRAY ...) into a strict JSON Schema for Groq:
+ * lowercase types, additionalProperties:false, and every property listed as required
+ * (optional properties become nullable, as Groq's strict mode requires).
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function toStrictJsonSchema(node: any): any {
+  if (!node || typeof node !== 'object') return node;
+  const type = String(node.type || '').toLowerCase();
+  const description = typeof node.description === 'string' ? node.description : undefined;
+
+  if (type === 'object') {
+    const props = (node.properties || {}) as Record<string, unknown>;
+    const requiredSet = new Set<string>(Array.isArray(node.required) ? node.required : []);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const outProps: Record<string, any> = {};
+    for (const [key, value] of Object.entries(props)) {
+      let child = toStrictJsonSchema(value);
+      if (!requiredSet.has(key)) {
+        child =
+          typeof child.type === 'string'
+            ? { ...child, type: [child.type, 'null'] }
+            : { anyOf: [child, { type: 'null' }] };
+      }
+      outProps[key] = child;
+    }
+    return {
+      type: 'object',
+      ...(description ? { description } : {}),
+      properties: outProps,
+      required: Object.keys(outProps),
+      additionalProperties: false,
+    };
+  }
+
+  if (type === 'array') {
+    return {
+      type: 'array',
+      ...(description ? { description } : {}),
+      items: toStrictJsonSchema(node.items),
+    };
+  }
+
+  return {
+    type: type || 'string',
+    ...(description ? { description } : {}),
+  };
+}
+
+async function callGroqChat(
+  model: string,
+  messages: unknown[],
+  schema: Record<string, unknown>,
+  maxTokens: number,
+  timeoutMs: number
+): Promise<string> {
+  const body: Record<string, unknown> = {
+    model,
+    messages,
+    temperature: 0.4,
+    max_completion_tokens: maxTokens,
+    response_format: {
+      type: 'json_schema',
+      json_schema: { name: 'bleppify_response', strict: true, schema },
+    },
+  };
+  const effort = groqReasoningEffortFor(model);
+  if (effort) body.reasoning_effort = effort;
+
+  const res = await fetch(GROQ_API_URL, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${getGroqApiKey()}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+
+  if (!res.ok) {
+    let detail = '';
+    try {
+      const errJson = (await res.json()) as { error?: { message?: string } };
+      detail = errJson?.error?.message || JSON.stringify(errJson);
+    } catch {
+      // ignore body parse errors
+    }
+    const retryAfter = Number(res.headers.get('retry-after'));
+    throw new GroqHttpError(
+      detail || `Groq API error ${res.status}`,
+      res.status,
+      Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : null
+    );
+  }
+
+  const data = (await res.json()) as {
+    choices?: Array<{ finish_reason?: string; message?: { content?: string | null } }>;
+  };
+  const choice = data?.choices?.[0];
+  const content = choice?.message?.content;
+  if (typeof content !== 'string' || !content.trim()) {
+    throw new GroqHttpError('Groq returned an empty response.', 502);
+  }
+  if (choice?.finish_reason === 'length') {
+    throw new GroqHttpError('Groq response was cut off before finishing (token limit).', 502);
+  }
+  return content;
+}
+
+async function generateWithGroq(
   contents: { parts: PartInput[] },
   config: Record<string, unknown>,
-  preferLowThinkingLatency = false
-) {
+  timeoutMs: number,
+  maxTokens: number
+): Promise<{ text: string }> {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const rawSchema = config.responseSchema as any;
+  if (!rawSchema) {
+    throw new Error('Internal error: missing response schema for Groq request.');
+  }
+
+  const converted = toStrictJsonSchema(rawSchema);
+  const rootIsArray = converted?.type === 'array';
+  const schema: Record<string, unknown> = rootIsArray
+    ? {
+        type: 'object',
+        properties: { items: converted },
+        required: ['items'],
+        additionalProperties: false,
+      }
+    : converted;
+
+  const textChunks: string[] = [];
+  const images: Array<{ mimeType: string; data: string }> = [];
+  for (const part of contents.parts) {
+    if ('text' in part) {
+      textChunks.push(part.text);
+    } else if ('inlineData' in part && part.inlineData.mimeType.startsWith('image/')) {
+      images.push(part.inlineData);
+    }
+  }
+
+  let promptText = textChunks.join('\n\n');
+  if (rootIsArray) {
+    promptText += '\n\nReturn a JSON object with a single key "items" whose value is the array described above.';
+  }
+
+  const userContent =
+    images.length > 0
+      ? [
+          ...images.map((img) => ({
+            type: 'image_url',
+            image_url: { url: `data:${img.mimeType};base64,${img.data}` },
+          })),
+          { type: 'text', text: promptText },
+        ]
+      : promptText;
+
+  const messages = [
+    {
+      role: 'system',
+      content:
+        'You are a precise assistant for Philippine BLEPP (Psychometrician board exam) review. Respond with JSON only, exactly matching the provided schema.',
+    },
+    { role: 'user', content: userContent },
+  ];
+
+  const models = images.length > 0 ? getGroqVisionModels() : getGroqTextModels();
+  let lastError: unknown = null;
+
+  for (let round = 0; round < 2; round++) {
+    const now = Date.now();
+    const active = models.filter((m) => (modelCooldownUntil.get(`groq:${m}`) || 0) <= now);
+    const ordered = active.length > 0 ? active : models;
+    let sawRateLimit = false;
+    let shortestWaitSec: number | null = null;
+
+    for (const model of ordered) {
+      const cooldownKey = `groq:${model}`;
+      try {
+        const content = await withGroqSlot(() =>
+          callGroqChat(model, messages, schema, maxTokens, timeoutMs)
+        );
+        modelCooldownUntil.delete(cooldownKey);
+        if (!rootIsArray) {
+          return { text: content };
+        }
+        const parsed = JSON.parse(content) as { items?: unknown };
+        return { text: JSON.stringify(Array.isArray(parsed?.items) ? parsed.items : []) };
+      } catch (err) {
+        lastError = err;
+        if (err instanceof GroqHttpError) {
+          if (err.status === 401 || err.status === 403) {
+            throw new Error('Groq rejected the API key. Check GROQ_API_KEY in your server environment variables.');
+          }
+          if (err.status === 429) {
+            sawRateLimit = true;
+            const waitSec = err.retryAfterSec ?? 20;
+            shortestWaitSec = shortestWaitSec === null ? waitSec : Math.min(shortestWaitSec, waitSec);
+            modelCooldownUntil.set(cooldownKey, Date.now() + waitSec * 1000);
+          } else if (err.status === 413) {
+            modelCooldownUntil.set(cooldownKey, Date.now() + 10_000);
+          } else {
+            modelCooldownUntil.set(cooldownKey, Date.now() + 2 * 60 * 1000);
+          }
+        } else {
+          // network error or timeout
+          modelCooldownUntil.set(cooldownKey, Date.now() + 30_000);
+        }
+      }
+    }
+
+    if (round === 0 && sawRateLimit && shortestWaitSec !== null && shortestWaitSec <= 20) {
+      await sleep(shortestWaitSec * 1000 + 250);
+      continue;
+    }
+    break;
+  }
+
+  if (lastError instanceof GroqHttpError && (lastError.status === 429 || lastError.status === 413)) {
+    throw new Error(
+      'Groq rate limit reached (the free plan allows roughly 8,000 tokens per minute per model). Please wait a minute and try again, or upgrade your Groq plan.'
+    );
+  }
+  throw lastError instanceof Error ? lastError : new Error('Groq request failed.');
+}
+
+async function generateWithFallback(
+  ai: AiClient,
+  contents: { parts: PartInput[] },
+  config: Record<string, unknown>,
+  preferLowThinkingLatency = false,
+  opts: { maxTokens?: number } = {}
+): Promise<{ text?: string }> {
+  if (ai.provider === 'groq') {
+    return generateWithGroq(contents, config, ai.timeoutMs, opts.maxTokens ?? 4000);
+  }
+  const geminiClient = ai.gemini as GoogleGenAI;
   const candidates = preferLowThinkingLatency ? FAST_JSON_MODELS : VISION_MODELS;
   const now = Date.now();
   const activeCandidates = candidates.filter((m) => (modelCooldownUntil.get(m) || 0) <= now);
@@ -208,7 +658,7 @@ async function generateWithFallback(
   let lastError: unknown = null;
   for (const model of orderedModels) {
     try {
-      const res = await ai.models.generateContent({
+      const res = await geminiClient.models.generateContent({
         model,
         contents,
         config,
@@ -377,7 +827,7 @@ app.post('/api/gemini/register-pdfs', async (req, res) => {
       return;
     }
 
-    const ai = getGeminiClient(45000);
+    const ai = getAiClient(45000);
     if (Array.isArray(pdfFiles)) {
       await Promise.all(
         pdfFiles.map(async (pdf: { id?: string; name?: string; mimeType?: string; base64Data?: string }) => {
@@ -391,7 +841,11 @@ app.post('/api/gemini/register-pdfs', async (req, res) => {
               base64Data: pdf.base64Data,
             });
           }
-          await getOrUploadGeminiPdfHandle(ai, mimeType, pdf.base64Data);
+          if (ai.provider === 'groq') {
+            await extractPdfText(pdf.base64Data);
+          } else {
+            await getOrUploadGeminiPdfHandle(ai.gemini as GoogleGenAI, mimeType, pdf.base64Data);
+          }
         })
       );
     }
@@ -418,9 +872,13 @@ app.post('/api/gemini/flashcards', async (req, res) => {
       excludeTerms = [],
       pdfFiles = [],
     } = req.body;
-    const ai = getGeminiClient(30000);
+    const ai = getAiClient(30000);
 
-    const { parts: pdfParts, missingIds } = await resolvePdfParts(ai, pdfFiles);
+    const { parts: pdfParts, missingIds } = await resolvePdfParts(
+      ai,
+      pdfFiles,
+      `${sectionTitle || ''} ${competencyText || ''}`
+    );
     if (missingIds.length > 0) {
       res.status(409).json({ error: 'PDF cache miss', code: 'PDF_CACHE_MISS', missingIds });
       return;
@@ -503,14 +961,15 @@ Return a JSON array of flashcards.`;
           },
         },
       },
-      true
+      true,
+      { maxTokens: 1200 + safeCount * 220 }
     );
 
     const rawText = (response.text ?? '[]').trim();
     const cards = JSON.parse(rawText);
     res.json({ flashcards: cards });
   } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : 'Failed to generate flashcards from Gemini API.';
+    const message = error instanceof Error ? error.message : 'Failed to generate flashcards.';
     res.status(500).json({ error: message });
   }
 });
@@ -534,8 +993,12 @@ app.post('/api/gemini/questions', async (req, res) => {
       pdfFiles = [],
     } = req.body;
 
-    const ai = getGeminiClient(35000);
-    const { parts: pdfParts, missingIds } = await resolvePdfParts(ai, pdfFiles);
+    const ai = getAiClient(35000);
+    const { parts: pdfParts, missingIds } = await resolvePdfParts(
+      ai,
+      pdfFiles,
+      `${scopeTitle || ''} ${lockedSectionTitle || ''} ${competencyDetails || ''} ${batchFocusHint || ''}`
+    );
     if (missingIds.length > 0) {
       res.status(409).json({ error: 'PDF cache miss', code: 'PDF_CACHE_MISS', missingIds });
       return;
@@ -693,7 +1156,8 @@ IMPORTANT: NEVER mention "Section A/B/C/D/E/F" or TOS code numbers inside stem, 
           },
         },
       },
-      true
+      true,
+      { maxTokens: 1400 + safeCount * 650 }
     );
 
     const rawText = (response.text ?? '[]').trim();
@@ -721,7 +1185,7 @@ IMPORTANT: NEVER mention "Section A/B/C/D/E/F" or TOS code numbers inside stem, 
       : [];
     res.json({ questions });
   } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : 'Failed to generate board exam items from Gemini API.';
+    const message = error instanceof Error ? error.message : 'Failed to generate board exam items.';
     res.status(500).json({ error: message });
   }
 });
@@ -735,7 +1199,7 @@ app.post('/api/gemini/scan-prc-sheet', async (req, res) => {
       return;
     }
 
-    const ai = getGeminiClient(60000);
+    const ai = getAiClient(60000);
 
     const visionPrompt = `You are an Optical Mark Recognition (OMR) scanner calibrated for the official Philippine Professional Regulation Commission (PRC) Examination Answer Sheet.
 Layout Geometry of the 150-Item PRC Answer Sheet:
@@ -803,7 +1267,9 @@ Inspect the uploaded photo or scan carefully for items 1 up to ${Math.min(150, M
           },
           required: ['detectedSet', 'rows'],
         },
-      }
+      },
+      false,
+      { maxTokens: 5000 }
     );
 
     const rawText = (response.text ?? '{}').trim();
