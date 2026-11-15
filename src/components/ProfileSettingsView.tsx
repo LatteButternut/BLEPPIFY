@@ -12,10 +12,16 @@ import {
   Upload,
 } from 'lucide-react';
 import {
+  alignAvatarCropBoxToRegion,
+  AvatarCropBox,
+  AvatarCropQuickRegion,
+  AvatarCropResizeHandle,
   calculateDailyQuestionProgress,
   calculateExamCountdown,
-  computeAvatarCropSourceRect,
-  computeCropPanFromImagePoint,
+  centerAvatarCropBoxAtPoint,
+  clampAvatarCropBox,
+  createAvatarCropBoxFromMarquee,
+  createInitialAvatarCropBox,
   DAILY_GOAL_PRESETS,
   DEFAULT_DAILY_QUESTION_GOAL,
   DEFAULT_TOPNOTCHER_TARGET_PERCENT,
@@ -30,10 +36,13 @@ import {
   MIN_AVATAR_CROP_ZOOM,
   MIN_DAILY_QUESTION_GOAL,
   MIN_TOPNOTCHER_TARGET_PERCENT,
+  moveAvatarCropBox,
   normalizeTopnotcherThreshold,
   parseLocalExamDate,
   QuestionAttemptLog,
+  resizeAvatarCropBoxFromHandle,
   TOPNOTCHER_THRESHOLD_PRESETS,
+  zoomAvatarCropBoxAroundCenter,
 } from '../utils/bleppLogic';
 import {
   sendPasswordResetEmailLink,
@@ -59,6 +68,7 @@ interface ProfileSettingsViewProps {
   isPasswordRecoveryActive?: boolean;
   onPasswordRecoveryComplete?: () => void;
   onSaveProfile: (payload: ProfileSettingsUpdatePayload) => void;
+  onApplyAvatar?: (nextAvatar: string | null) => void;
   onBackToHome: () => void;
   onDeleteAccount: () => Promise<{ ok: boolean; error?: string }>;
 }
@@ -78,13 +88,44 @@ interface CropStageLayout {
   scale: number;
 }
 
+type StageCursorClass =
+  | 'cursor-move'
+  | 'cursor-nwse-resize'
+  | 'cursor-nesw-resize'
+  | 'cursor-crosshair';
+
+type ActiveCropGesture =
+  | {
+      pointerId: number;
+      mode: 'move';
+      startBox: AvatarCropBox;
+      startImgX: number;
+      startImgY: number;
+    }
+  | {
+      pointerId: number;
+      mode: 'resize';
+      handle: AvatarCropResizeHandle;
+      startBox: AvatarCropBox;
+    }
+  | {
+      pointerId: number;
+      mode: 'outside';
+      startBox: AvatarCropBox;
+      startImgX: number;
+      startImgY: number;
+      startCanvasX: number;
+      startCanvasY: number;
+      hasDraggedMarquee: boolean;
+    };
+
 function computeStageLayout(
   canvasWidth: number,
   canvasHeight: number,
   naturalWidth: number,
   naturalHeight: number
 ): CropStageLayout {
-  const pad = 16;
+  const pad = 18;
   const availW = Math.max(40, canvasWidth - pad * 2);
   const availH = Math.max(40, canvasHeight - pad * 2);
   const scale = Math.min(availW / naturalWidth, availH / naturalHeight);
@@ -93,6 +134,64 @@ function computeStageLayout(
   const drawX = (canvasWidth - drawW) / 2;
   const drawY = (canvasHeight - drawH) / 2;
   return { drawX, drawY, drawW, drawH, scale };
+}
+
+function getCanvasAndImageCoords(
+  canvas: HTMLCanvasElement,
+  clientX: number,
+  clientY: number,
+  naturalWidth: number,
+  naturalHeight: number
+): {
+  canvasX: number;
+  canvasY: number;
+  imgX: number;
+  imgY: number;
+  layout: CropStageLayout;
+} {
+  const bounds = canvas.getBoundingClientRect();
+  const contentLeft = bounds.left + (canvas.clientLeft || 0);
+  const contentTop = bounds.top + (canvas.clientTop || 0);
+  const contentWidth = Math.max(1, canvas.clientWidth || bounds.width);
+  const contentHeight = Math.max(1, canvas.clientHeight || bounds.height);
+
+  const canvasX = ((clientX - contentLeft) / contentWidth) * canvas.width;
+  const canvasY = ((clientY - contentTop) / contentHeight) * canvas.height;
+  const layout = computeStageLayout(
+    canvas.width,
+    canvas.height,
+    naturalWidth,
+    naturalHeight
+  );
+  const imgX = (canvasX - layout.drawX) / Math.max(0.0001, layout.scale);
+  const imgY = (canvasY - layout.drawY) / Math.max(0.0001, layout.scale);
+
+  return { canvasX, canvasY, imgX, imgY, layout };
+}
+
+function hitTestResizeHandle(
+  canvasX: number,
+  canvasY: number,
+  selX: number,
+  selY: number,
+  selSide: number
+): AvatarCropResizeHandle | null {
+  const hitRadius = 18;
+  const corners: Array<{ handle: AvatarCropResizeHandle; cx: number; cy: number }> = [
+    { handle: 'nw', cx: selX, cy: selY },
+    { handle: 'ne', cx: selX + selSide, cy: selY },
+    { handle: 'sw', cx: selX, cy: selY + selSide },
+    { handle: 'se', cx: selX + selSide, cy: selY + selSide },
+  ];
+
+  let best: { handle: AvatarCropResizeHandle; dist: number } | null = null;
+  for (const corner of corners) {
+    const dist = Math.hypot(canvasX - corner.cx, canvasY - corner.cy);
+    if (dist <= hitRadius && (!best || dist < best.dist)) {
+      best = { handle: corner.handle, dist };
+    }
+  }
+  return best ? best.handle : null;
 }
 
 function normalizeDrawableToCropImage(
@@ -175,11 +274,9 @@ async function readImageFileForCrop(file: File): Promise<LoadedCropImage> {
   return loadImageFromDataUrl(rawDataUrl);
 }
 
-function renderCroppedAvatarDataUrl(
+function renderCroppedAvatarBoxDataUrl(
   loaded: LoadedCropImage,
-  zoom: number,
-  panX: number,
-  panY: number
+  box: AvatarCropBox
 ): string {
   const targetSize = 256;
   const canvas = document.createElement('canvas');
@@ -190,27 +287,25 @@ function renderCroppedAvatarDataUrl(
     return loaded.srcDataUrl;
   }
 
-  const rect = computeAvatarCropSourceRect(
+  const clamped = clampAvatarCropBox(
+    box,
     loaded.naturalWidth,
-    loaded.naturalHeight,
-    zoom,
-    panX,
-    panY
+    loaded.naturalHeight
   );
   ctx.fillStyle = '#FFFFFF';
   ctx.fillRect(0, 0, targetSize, targetSize);
   ctx.drawImage(
     loaded.sourceCanvas,
-    rect.sx,
-    rect.sy,
-    rect.sSide,
-    rect.sSide,
+    clamped.x,
+    clamped.y,
+    clamped.side,
+    clamped.side,
     0,
     0,
     targetSize,
     targetSize
   );
-  return canvas.toDataURL('image/jpeg', 0.9);
+  return canvas.toDataURL('image/jpeg', 0.92);
 }
 
 export const ProfileSettingsView: React.FC<ProfileSettingsViewProps> = ({
@@ -224,6 +319,7 @@ export const ProfileSettingsView: React.FC<ProfileSettingsViewProps> = ({
   isPasswordRecoveryActive = false,
   onPasswordRecoveryComplete,
   onSaveProfile,
+  onApplyAvatar,
   onBackToHome,
   onDeleteAccount,
 }) => {
@@ -241,16 +337,20 @@ export const ProfileSettingsView: React.FC<ProfileSettingsViewProps> = ({
 
   const [validationError, setValidationError] = useState<string | null>(null);
   const [photoError, setPhotoError] = useState<string | null>(null);
+  const [photoAppliedNotice, setPhotoAppliedNotice] = useState<boolean>(false);
   const [isUploadingPhoto, setIsUploadingPhoto] = useState<boolean>(false);
   const [savedBanner, setSavedBanner] = useState<boolean>(false);
 
-  // Interactive photo cropper state
+  // Direct pixel-space photo cropper state
   const [lastRawImage, setLastRawImage] = useState<LoadedCropImage | null>(null);
+  const [lastAppliedCropBox, setLastAppliedCropBox] = useState<AvatarCropBox | null>(
+    null
+  );
   const [cropSession, setCropSession] = useState<LoadedCropImage | null>(null);
-  const [cropZoom, setCropZoom] = useState<number>(1);
-  const [cropPanX, setCropPanX] = useState<number>(0);
-  const [cropPanY, setCropPanY] = useState<number>(0);
+  const [cropBox, setCropBox] = useState<AvatarCropBox>({ x: 0, y: 0, side: 180 });
   const [isDraggingCrop, setIsDraggingCrop] = useState<boolean>(false);
+  const [stageCursor, setStageCursor] =
+    useState<StageCursorClass>('cursor-crosshair');
 
   // Change password (email reset link + recovery completion) states
   const [resetEmailInput, setResetEmailInput] = useState<string>(userEmail || '');
@@ -275,7 +375,13 @@ export const ProfileSettingsView: React.FC<ProfileSettingsViewProps> = ({
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const cropCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const activePointerIdRef = useRef<number | null>(null);
+  const cropBoxRef = useRef<AvatarCropBox>(cropBox);
+  const dragGestureRef = useRef<ActiveCropGesture | null>(null);
+
+  const commitCropBox = (next: AvatarCropBox) => {
+    cropBoxRef.current = next;
+    setCropBox(next);
+  };
 
   useEffect(() => {
     setNameDraft(profileName || '');
@@ -347,20 +453,36 @@ export const ProfileSettingsView: React.FC<ProfileSettingsViewProps> = ({
   const liveCroppedPreviewUrl = useMemo(() => {
     if (!cropSession) return null;
     try {
-      return renderCroppedAvatarDataUrl(
-        cropSession,
-        cropZoom,
-        cropPanX,
-        cropPanY
-      );
+      return renderCroppedAvatarBoxDataUrl(cropSession, cropBox);
     } catch {
       return cropSession.srcDataUrl;
     }
-  }, [cropSession, cropZoom, cropPanX, cropPanY]);
+  }, [cropSession, cropBox]);
 
   const displayedAvatarUrl = liveCroppedPreviewUrl || avatarDraft;
 
-  // Draw Full-Photo Crop Stage showing the entire uploaded image + draggable crop window
+  // Derived slider readouts directly from cropBox
+  const cropMaxSide = cropSession
+    ? Math.min(cropSession.naturalWidth, cropSession.naturalHeight)
+    : 1;
+  const derivedZoom = cropSession
+    ? Math.min(
+        MAX_AVATAR_CROP_ZOOM,
+        Math.max(MIN_AVATAR_CROP_ZOOM, cropMaxSide / Math.max(1, cropBox.side))
+      )
+    : 1;
+  const maxOffsetX = cropSession
+    ? Math.max(0, cropSession.naturalWidth - cropBox.side)
+    : 0;
+  const maxOffsetY = cropSession
+    ? Math.max(0, cropSession.naturalHeight - cropBox.side)
+    : 0;
+  const horizontalOffsetPercent =
+    maxOffsetX > 0.5 ? Math.round((cropBox.x / maxOffsetX) * 100) : 50;
+  const verticalOffsetPercent =
+    maxOffsetY > 0.5 ? Math.round((cropBox.y / maxOffsetY) * 100) : 50;
+
+  // Draw Full-Photo Crop Stage showing the entire uploaded image + draggable/resizable crop window
   useEffect(() => {
     if (!cropSession || !cropCanvasRef.current) return;
     const canvas = cropCanvasRef.current;
@@ -375,17 +497,15 @@ export const ProfileSettingsView: React.FC<ProfileSettingsViewProps> = ({
       cropSession.naturalWidth,
       cropSession.naturalHeight
     );
-    const rect = computeAvatarCropSourceRect(
+    const clamped = clampAvatarCropBox(
+      cropBox,
       cropSession.naturalWidth,
-      cropSession.naturalHeight,
-      cropZoom,
-      cropPanX,
-      cropPanY
+      cropSession.naturalHeight
     );
 
-    const selX = layout.drawX + rect.sx * layout.scale;
-    const selY = layout.drawY + rect.sy * layout.scale;
-    const selSide = rect.sSide * layout.scale;
+    const selX = layout.drawX + clamped.x * layout.scale;
+    const selY = layout.drawY + clamped.y * layout.scale;
+    const selSide = clamped.side * layout.scale;
     const selCenterX = selX + selSide / 2;
     const selCenterY = selY + selSide / 2;
     const selRadius = selSide / 2;
@@ -425,10 +545,10 @@ export const ProfileSettingsView: React.FC<ProfileSettingsViewProps> = ({
     ctx.fill();
     ctx.restore();
 
-    // 4. Optional rule-of-thirds alignment grid while dragging
+    // 4. Rule-of-thirds alignment grid while dragging/resizing
     if (isDraggingCrop) {
       ctx.save();
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.42)';
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.44)';
       ctx.lineWidth = 1.25;
       const step = selSide / 3;
       for (let i = 1; i <= 2; i++) {
@@ -445,7 +565,7 @@ export const ProfileSettingsView: React.FC<ProfileSettingsViewProps> = ({
     }
 
     // 5. Crisp square crop frame + inscribed circular avatar ring
-    ctx.strokeStyle = 'rgba(255, 255, 255, 0.95)';
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.96)';
     ctx.lineWidth = 2.5;
     ctx.strokeRect(selX, selY, selSide, selSide);
 
@@ -454,45 +574,30 @@ export const ProfileSettingsView: React.FC<ProfileSettingsViewProps> = ({
     ctx.strokeStyle = '#68C7C5';
     ctx.lineWidth = 2.5;
     ctx.stroke();
-  }, [cropSession, cropZoom, cropPanX, cropPanY, isDraggingCrop]);
 
-  const updateCropFromStagePointer = (
-    canvas: HTMLCanvasElement,
-    clientX: number,
-    clientY: number
-  ) => {
-    if (!cropSession) return;
-    const bounds = canvas.getBoundingClientRect();
-    const cssToCanvasX = canvas.width / Math.max(1, bounds.width);
-    const cssToCanvasY = canvas.height / Math.max(1, bounds.height);
-    const canvasX = (clientX - bounds.left) * cssToCanvasX;
-    const canvasY = (clientY - bounds.top) * cssToCanvasY;
-
-    const layout = computeStageLayout(
-      canvas.width,
-      canvas.height,
-      cropSession.naturalWidth,
-      cropSession.naturalHeight
-    );
-
-    const imgX = (canvasX - layout.drawX) / Math.max(0.0001, layout.scale);
-    const imgY = (canvasY - layout.drawY) / Math.max(0.0001, layout.scale);
-
-    const nextPan = computeCropPanFromImagePoint(
-      cropSession.naturalWidth,
-      cropSession.naturalHeight,
-      cropZoom,
-      imgX,
-      imgY
-    );
-    setCropPanX(nextPan.panX);
-    setCropPanY(nextPan.panY);
-  };
+    // 6. Draw 4 visible corner resize handles (NW, NE, SW, SE)
+    const handleSize = 12;
+    const halfH = handleSize / 2;
+    const handlePts = [
+      [selX, selY],
+      [selX + selSide, selY],
+      [selX, selY + selSide],
+      [selX + selSide, selY + selSide],
+    ];
+    for (const [hx, hy] of handlePts) {
+      ctx.fillStyle = '#FFFFFF';
+      ctx.strokeStyle = '#0D254C';
+      ctx.lineWidth = 2;
+      ctx.fillRect(hx - halfH, hy - halfH, handleSize, handleSize);
+      ctx.strokeRect(hx - halfH, hy - halfH, handleSize, handleSize);
+    }
+  }, [cropSession, cropBox, isDraggingCrop]);
 
   const handlePhotoChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     setPhotoError(null);
+    setPhotoAppliedNotice(false);
     setSavedBanner(false);
 
     if (!file.type.startsWith('image/')) {
@@ -509,11 +614,14 @@ export const ProfileSettingsView: React.FC<ProfileSettingsViewProps> = ({
     setIsUploadingPhoto(true);
     try {
       const loaded = await readImageFileForCrop(file);
+      const initialBox = createInitialAvatarCropBox(
+        loaded.naturalWidth,
+        loaded.naturalHeight
+      );
       setLastRawImage(loaded);
+      setLastAppliedCropBox(null);
       setCropSession(loaded);
-      setCropZoom(1);
-      setCropPanX(0);
-      setCropPanY(0);
+      commitCropBox(initialBox);
     } catch (err: unknown) {
       setPhotoError(
         err instanceof Error ? err.message : 'Unable to process the selected photo.'
@@ -526,19 +634,34 @@ export const ProfileSettingsView: React.FC<ProfileSettingsViewProps> = ({
 
   const handleReopenCrop = async () => {
     setPhotoError(null);
+    setPhotoAppliedNotice(false);
     setSavedBanner(false);
     if (lastRawImage) {
+      const restoredBox = lastAppliedCropBox
+        ? clampAvatarCropBox(
+            lastAppliedCropBox,
+            lastRawImage.naturalWidth,
+            lastRawImage.naturalHeight
+          )
+        : createInitialAvatarCropBox(
+            lastRawImage.naturalWidth,
+            lastRawImage.naturalHeight
+          );
       setCropSession(lastRawImage);
+      commitCropBox(restoredBox);
       return;
     }
     if (!avatarDraft) return;
     setIsUploadingPhoto(true);
     try {
       const loaded = await loadImageFromDataUrl(avatarDraft);
+      const initialBox = createInitialAvatarCropBox(
+        loaded.naturalWidth,
+        loaded.naturalHeight
+      );
+      setLastRawImage(loaded);
       setCropSession(loaded);
-      setCropZoom(1);
-      setCropPanX(0);
-      setCropPanY(0);
+      commitCropBox(initialBox);
     } catch {
       setPhotoError('Unable to open the current photo for cropping. Please upload a new photo.');
     } finally {
@@ -549,49 +672,266 @@ export const ProfileSettingsView: React.FC<ProfileSettingsViewProps> = ({
   const handleApplyCrop = () => {
     if (!cropSession) return;
     try {
-      const croppedDataUrl = renderCroppedAvatarDataUrl(
-        cropSession,
-        cropZoom,
-        cropPanX,
-        cropPanY
+      const latestBox = clampAvatarCropBox(
+        cropBoxRef.current,
+        cropSession.naturalWidth,
+        cropSession.naturalHeight
       );
+      const croppedDataUrl = renderCroppedAvatarBoxDataUrl(
+        cropSession,
+        latestBox
+      );
+      setLastAppliedCropBox(latestBox);
       setAvatarLoadError(false);
       setAvatarDraft(croppedDataUrl);
       setCropSession(null);
-      setSavedBanner(false);
+      setPhotoAppliedNotice(true);
+      onApplyAvatar?.(croppedDataUrl);
     } catch {
       setPhotoError('Could not crop the selected region. Please try again.');
     }
   };
 
-  const handleQuickHorizontalRegion = (targetPanX: -1 | 0 | 1) => {
+  const handleQuickRegionSelect = (region: AvatarCropQuickRegion) => {
     if (!cropSession) return;
-    const minDim = Math.min(cropSession.naturalWidth, cropSession.naturalHeight);
-    const currentSide = minDim / cropZoom;
-    if (targetPanX !== 0 && cropSession.naturalWidth - currentSide < 1) {
-      setCropZoom(1.5);
+    const nextBox = alignAvatarCropBoxToRegion(
+      cropBoxRef.current,
+      region,
+      cropSession.naturalWidth,
+      cropSession.naturalHeight
+    );
+    commitCropBox(nextBox);
+  };
+
+  const handleZoomSliderChange = (nextZoomValue: number) => {
+    if (!cropSession) return;
+    const nextBox = zoomAvatarCropBoxAroundCenter(
+      cropBoxRef.current,
+      nextZoomValue,
+      cropSession.naturalWidth,
+      cropSession.naturalHeight
+    );
+    commitCropBox(nextBox);
+  };
+
+  const handleHorizontalSliderChange = (percentValue: number) => {
+    if (!cropSession) return;
+    const current = cropBoxRef.current;
+    const w = cropSession.naturalWidth;
+    const h = cropSession.naturalHeight;
+    let side = current.side;
+    if (w - side < 1) {
+      side = Math.min(w, h) * 0.72;
     }
-    setCropPanX(targetPanX);
+    const availX = Math.max(0, w - side);
+    const nextX = (Math.min(100, Math.max(0, percentValue)) / 100) * availX;
+    commitCropBox(clampAvatarCropBox({ x: nextX, y: current.y, side }, w, h));
+  };
+
+  const handleVerticalSliderChange = (percentValue: number) => {
+    if (!cropSession) return;
+    const current = cropBoxRef.current;
+    const w = cropSession.naturalWidth;
+    const h = cropSession.naturalHeight;
+    let side = current.side;
+    if (h - side < 1) {
+      side = Math.min(w, h) * 0.72;
+    }
+    const availY = Math.max(0, h - side);
+    const nextY = (Math.min(100, Math.max(0, percentValue)) / 100) * availY;
+    commitCropBox(clampAvatarCropBox({ x: current.x, y: nextY, side }, w, h));
+  };
+
+  const updateHoverCursor = (
+    canvas: HTMLCanvasElement,
+    clientX: number,
+    clientY: number
+  ) => {
+    if (!cropSession) return;
+    const { canvasX, canvasY, imgX, imgY, layout } = getCanvasAndImageCoords(
+      canvas,
+      clientX,
+      clientY,
+      cropSession.naturalWidth,
+      cropSession.naturalHeight
+    );
+    const current = cropBoxRef.current;
+    const selX = layout.drawX + current.x * layout.scale;
+    const selY = layout.drawY + current.y * layout.scale;
+    const selSide = current.side * layout.scale;
+
+    const handle = hitTestResizeHandle(canvasX, canvasY, selX, selY, selSide);
+    if (handle === 'nw' || handle === 'se') {
+      setStageCursor('cursor-nwse-resize');
+      return;
+    }
+    if (handle === 'ne' || handle === 'sw') {
+      setStageCursor('cursor-nesw-resize');
+      return;
+    }
+    const insideBox =
+      imgX >= current.x &&
+      imgX <= current.x + current.side &&
+      imgY >= current.y &&
+      imgY <= current.y + current.side;
+    setStageCursor(insideBox ? 'cursor-move' : 'cursor-crosshair');
   };
 
   const handleCropPointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
     if (!cropSession) return;
     e.currentTarget.setPointerCapture(e.pointerId);
-    activePointerIdRef.current = e.pointerId;
+    const { canvasX, canvasY, imgX, imgY, layout } = getCanvasAndImageCoords(
+      e.currentTarget,
+      e.clientX,
+      e.clientY,
+      cropSession.naturalWidth,
+      cropSession.naturalHeight
+    );
+    const current = clampAvatarCropBox(
+      cropBoxRef.current,
+      cropSession.naturalWidth,
+      cropSession.naturalHeight
+    );
+    const selX = layout.drawX + current.x * layout.scale;
+    const selY = layout.drawY + current.y * layout.scale;
+    const selSide = current.side * layout.scale;
+
+    const handle = hitTestResizeHandle(canvasX, canvasY, selX, selY, selSide);
+    if (handle) {
+      dragGestureRef.current = {
+        pointerId: e.pointerId,
+        mode: 'resize',
+        handle,
+        startBox: current,
+      };
+      setIsDraggingCrop(true);
+      return;
+    }
+
+    const insideBox =
+      imgX >= current.x &&
+      imgX <= current.x + current.side &&
+      imgY >= current.y &&
+      imgY <= current.y + current.side;
+
+    if (insideBox) {
+      dragGestureRef.current = {
+        pointerId: e.pointerId,
+        mode: 'move',
+        startBox: current,
+        startImgX: imgX,
+        startImgY: imgY,
+      };
+      setStageCursor('cursor-move');
+      setIsDraggingCrop(true);
+      return;
+    }
+
+    dragGestureRef.current = {
+      pointerId: e.pointerId,
+      mode: 'outside',
+      startBox: current,
+      startImgX: imgX,
+      startImgY: imgY,
+      startCanvasX: canvasX,
+      startCanvasY: canvasY,
+      hasDraggedMarquee: false,
+    };
+    setStageCursor('cursor-crosshair');
     setIsDraggingCrop(true);
-    updateCropFromStagePointer(e.currentTarget, e.clientX, e.clientY);
   };
 
   const handleCropPointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (!cropSession || activePointerIdRef.current !== e.pointerId) return;
-    updateCropFromStagePointer(e.currentTarget, e.clientX, e.clientY);
+    if (!cropSession) return;
+    const gesture = dragGestureRef.current;
+    if (!gesture) {
+      updateHoverCursor(e.currentTarget, e.clientX, e.clientY);
+      return;
+    }
+    if (gesture.pointerId !== e.pointerId) return;
+
+    const { canvasX, canvasY, imgX, imgY } = getCanvasAndImageCoords(
+      e.currentTarget,
+      e.clientX,
+      e.clientY,
+      cropSession.naturalWidth,
+      cropSession.naturalHeight
+    );
+
+    if (gesture.mode === 'move') {
+      const nextBox = moveAvatarCropBox(
+        gesture.startBox,
+        imgX - gesture.startImgX,
+        imgY - gesture.startImgY,
+        cropSession.naturalWidth,
+        cropSession.naturalHeight
+      );
+      commitCropBox(nextBox);
+      return;
+    }
+
+    if (gesture.mode === 'resize') {
+      const nextBox = resizeAvatarCropBoxFromHandle(
+        gesture.startBox,
+        gesture.handle,
+        imgX,
+        imgY,
+        cropSession.naturalWidth,
+        cropSession.naturalHeight
+      );
+      commitCropBox(nextBox);
+      return;
+    }
+
+    // Outside box: drag draws a free marquee square from press point; single click moves box on release
+    const movedCanvasDist = Math.hypot(
+      canvasX - gesture.startCanvasX,
+      canvasY - gesture.startCanvasY
+    );
+    if (gesture.hasDraggedMarquee || movedCanvasDist >= 10) {
+      gesture.hasDraggedMarquee = true;
+      const nextBox = createAvatarCropBoxFromMarquee(
+        gesture.startImgX,
+        gesture.startImgY,
+        imgX,
+        imgY,
+        cropSession.naturalWidth,
+        cropSession.naturalHeight
+      );
+      commitCropBox(nextBox);
+    }
   };
 
   const handleCropPointerEnd = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (activePointerIdRef.current === e.pointerId) {
-      activePointerIdRef.current = null;
-      setIsDraggingCrop(false);
+    const gesture = dragGestureRef.current;
+    if (!gesture || gesture.pointerId !== e.pointerId) return;
+
+    if (
+      cropSession &&
+      gesture.mode === 'outside' &&
+      !gesture.hasDraggedMarquee &&
+      e.type !== 'pointercancel'
+    ) {
+      const { imgX, imgY } = getCanvasAndImageCoords(
+        e.currentTarget,
+        e.clientX,
+        e.clientY,
+        cropSession.naturalWidth,
+        cropSession.naturalHeight
+      );
+      const nextBox = centerAvatarCropBoxAtPoint(
+        gesture.startBox,
+        imgX,
+        imgY,
+        cropSession.naturalWidth,
+        cropSession.naturalHeight
+      );
+      commitCropBox(nextBox);
     }
+
+    dragGestureRef.current = null;
+    setIsDraggingCrop(false);
+    updateHoverCursor(e.currentTarget, e.clientX, e.clientY);
   };
 
   const handleSendResetEmail = async () => {
@@ -695,12 +1035,13 @@ export const ProfileSettingsView: React.FC<ProfileSettingsViewProps> = ({
     let finalAvatar = avatarDraft;
     if (cropSession) {
       try {
-        finalAvatar = renderCroppedAvatarDataUrl(
-          cropSession,
-          cropZoom,
-          cropPanX,
-          cropPanY
+        const latestBox = clampAvatarCropBox(
+          cropBoxRef.current,
+          cropSession.naturalWidth,
+          cropSession.naturalHeight
         );
+        finalAvatar = renderCroppedAvatarBoxDataUrl(cropSession, latestBox);
+        setLastAppliedCropBox(latestBox);
         setAvatarDraft(finalAvatar);
         setAvatarLoadError(false);
         setCropSession(null);
@@ -723,6 +1064,7 @@ export const ProfileSettingsView: React.FC<ProfileSettingsViewProps> = ({
     setGoalInput(String(normalizedGoal));
     setTopnotcherThresholdInput(formatThresholdPercent(normalizedThreshold));
     setExamDateDraft(normalizedExamDate);
+    setPhotoAppliedNotice(false);
     setSavedBanner(true);
   };
 
@@ -843,7 +1185,7 @@ export const ProfileSettingsView: React.FC<ProfileSettingsViewProps> = ({
                   type="button"
                   disabled={isUploadingPhoto}
                   onClick={() => fileInputRef.current?.click()}
-                  className="min-h-[40px] inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-[#0D254C] hover:bg-[#163567] dark:bg-[#234B82] dark:hover:bg-[#2C5B9C] disabled:opacity-60 text-white text-xs font-semibold transition-colors whitespace-nowrap"
+                  className="min-h-[40px] inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-[#0D254C] hover:bg-[#163567] dark:bg-[#234B82] dark:hover:bg-[#2C5B9C] disabled:opacity-60 text-white text-xs font-semibold transition-colors whitespace-nowrap shrink-0"
                 >
                   <Upload className="w-3.5 h-3.5" />
                   <span>{isUploadingPhoto ? 'Loading Photo...' : 'Upload Photo'}</span>
@@ -854,7 +1196,7 @@ export const ProfileSettingsView: React.FC<ProfileSettingsViewProps> = ({
                     type="button"
                     disabled={isUploadingPhoto}
                     onClick={handleReopenCrop}
-                    className="min-h-[40px] inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg border border-slate-200 dark:border-[#293D5C] bg-[#F8FAFC] dark:bg-[#0F1A2C] hover:bg-slate-100 dark:hover:bg-[#1A2942] text-xs font-semibold text-[#0D254C] dark:text-[#E6ECF5] transition-colors whitespace-nowrap"
+                    className="min-h-[40px] inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg border border-slate-200 dark:border-[#293D5C] bg-[#F8FAFC] dark:bg-[#0F1A2C] hover:bg-slate-100 dark:hover:bg-[#1A2942] text-xs font-semibold text-[#0D254C] dark:text-[#E6ECF5] transition-colors whitespace-nowrap shrink-0"
                   >
                     <Crop className="w-3.5 h-3.5" />
                     <span>Crop Photo</span>
@@ -867,19 +1209,30 @@ export const ProfileSettingsView: React.FC<ProfileSettingsViewProps> = ({
                     onClick={() => {
                       setAvatarDraft(null);
                       setLastRawImage(null);
+                      setLastAppliedCropBox(null);
                       setCropSession(null);
                       setAvatarLoadError(false);
+                      setPhotoAppliedNotice(false);
                       setSavedBanner(false);
+                      onApplyAvatar?.(null);
                     }}
-                    className="min-h-[40px] px-3.5 py-2 rounded-lg border border-slate-200 dark:border-[#293D5C] bg-[#F8FAFC] dark:bg-[#0F1A2C] hover:bg-slate-100 dark:hover:bg-[#1A2942] text-xs font-semibold text-slate-700 dark:text-[#C5D2E3] transition-colors whitespace-nowrap"
+                    className="min-h-[40px] px-3.5 py-2 rounded-lg border border-slate-200 dark:border-[#293D5C] bg-[#F8FAFC] dark:bg-[#0F1A2C] hover:bg-slate-100 dark:hover:bg-[#1A2942] text-xs font-semibold text-slate-700 dark:text-[#C5D2E3] transition-colors whitespace-nowrap shrink-0"
                   >
                     Remove Photo
                   </button>
                 )}
               </div>
               <p className="text-xs text-slate-500 dark:text-[#9FB0C7]">
-                JPG, PNG, or WEBP up to 12 MB. Choose and crop any section of your photo.
+                JPG, PNG, or WEBP up to 12 MB. Drag the crop frame or corners to choose any section of your photo.
               </p>
+              {photoAppliedNotice && !photoError && (
+                <p
+                  role="status"
+                  className="text-xs font-medium text-[#2E7978] dark:text-[#68C7C5]"
+                >
+                  Cropped photo applied and saved to your profile.
+                </p>
+              )}
               {photoError && (
                 <p className="text-xs font-medium text-rose-700 dark:text-rose-400">
                   {photoError}
@@ -901,15 +1254,18 @@ export const ProfileSettingsView: React.FC<ProfileSettingsViewProps> = ({
                     Crop Profile Photo
                   </h3>
                   <p className="text-xs text-slate-500 dark:text-[#9FB0C7]">
-                    Click or drag directly on your photo, or adjust zoom and position to choose your exact profile section.
+                    Drag inside the frame to move, drag corners to resize, or drag across any area to draw a new crop section.
                   </p>
                 </div>
                 <button
                   type="button"
                   onClick={() => {
-                    setCropZoom(1);
-                    setCropPanX(0);
-                    setCropPanY(0);
+                    commitCropBox(
+                      createInitialAvatarCropBox(
+                        cropSession.naturalWidth,
+                        cropSession.naturalHeight
+                      )
+                    );
                   }}
                   className="inline-flex items-center gap-1 text-xs font-semibold text-[#2E7978] dark:text-[#68C7C5] hover:underline whitespace-nowrap shrink-0"
                 >
@@ -923,13 +1279,13 @@ export const ProfileSettingsView: React.FC<ProfileSettingsViewProps> = ({
                   <canvas
                     ref={cropCanvasRef}
                     data-testid="avatar-crop-canvas"
-                    width={560}
-                    height={400}
+                    width={600}
+                    height={440}
                     onPointerDown={handleCropPointerDown}
                     onPointerMove={handleCropPointerMove}
                     onPointerUp={handleCropPointerEnd}
                     onPointerCancel={handleCropPointerEnd}
-                    className="w-[260px] h-[186px] sm:w-[280px] sm:h-[200px] rounded-xl border border-slate-300 dark:border-[#293D5C] cursor-crosshair touch-none select-none"
+                    className={`w-[272px] h-[200px] sm:w-[300px] sm:h-[220px] rounded-xl border border-slate-300 dark:border-[#293D5C] touch-none select-none ${stageCursor}`}
                   />
                   {liveCroppedPreviewUrl && (
                     <div className="flex items-center gap-2.5 text-xs text-slate-600 dark:text-[#9FB0C7]">
@@ -938,7 +1294,7 @@ export const ProfileSettingsView: React.FC<ProfileSettingsViewProps> = ({
                         alt="Selected crop preview"
                         data-testid="avatar-crop-live-preview"
                         referrerPolicy="no-referrer"
-                        className="w-11 h-11 rounded-full object-cover border border-[#2E7978]/60 dark:border-[#68C7C5]/70 shrink-0"
+                        className="w-12 h-12 rounded-full object-cover border border-[#2E7978]/60 dark:border-[#68C7C5]/70 shrink-0"
                       />
                       <span>Live cropped result</span>
                     </div>
@@ -946,31 +1302,28 @@ export const ProfileSettingsView: React.FC<ProfileSettingsViewProps> = ({
                 </div>
 
                 <div className="flex-1 w-full space-y-3.5">
-                  <div className="flex items-center gap-1.5">
-                    <span className="text-xs font-semibold text-[#0F172A] dark:text-[#E6ECF5] mr-1">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="text-xs font-semibold text-[#0F172A] dark:text-[#E6ECF5] mr-1 whitespace-nowrap">
                       Quick region:
                     </span>
-                    <button
-                      type="button"
-                      onClick={() => handleQuickHorizontalRegion(-1)}
-                      className="min-h-[30px] px-2.5 py-1 text-xs font-medium rounded-md border border-slate-200 dark:border-[#293D5C] bg-white dark:bg-[#131F33] hover:bg-slate-50 dark:hover:bg-[#1A2942] text-[#0D254C] dark:text-[#E6ECF5] transition-colors whitespace-nowrap shrink-0"
-                    >
-                      Left
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleQuickHorizontalRegion(0)}
-                      className="min-h-[30px] px-2.5 py-1 text-xs font-medium rounded-md border border-slate-200 dark:border-[#293D5C] bg-white dark:bg-[#131F33] hover:bg-slate-50 dark:hover:bg-[#1A2942] text-[#0D254C] dark:text-[#E6ECF5] transition-colors whitespace-nowrap shrink-0"
-                    >
-                      Center
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleQuickHorizontalRegion(1)}
-                      className="min-h-[30px] px-2.5 py-1 text-xs font-medium rounded-md border border-slate-200 dark:border-[#293D5C] bg-white dark:bg-[#131F33] hover:bg-slate-50 dark:hover:bg-[#1A2942] text-[#0D254C] dark:text-[#E6ECF5] transition-colors whitespace-nowrap shrink-0"
-                    >
-                      Right
-                    </button>
+                    {(
+                      [
+                        { key: 'left', label: 'Left' },
+                        { key: 'center', label: 'Center' },
+                        { key: 'right', label: 'Right' },
+                        { key: 'top', label: 'Top' },
+                        { key: 'bottom', label: 'Bottom' },
+                      ] as const
+                    ).map((item) => (
+                      <button
+                        key={item.key}
+                        type="button"
+                        onClick={() => handleQuickRegionSelect(item.key)}
+                        className="min-h-[30px] px-2.5 py-1 text-xs font-medium rounded-md border border-slate-200 dark:border-[#293D5C] bg-white dark:bg-[#131F33] hover:bg-slate-50 dark:hover:bg-[#1A2942] text-[#0D254C] dark:text-[#E6ECF5] transition-colors whitespace-nowrap shrink-0"
+                      >
+                        {item.label}
+                      </button>
+                    ))}
                   </div>
 
                   <div className="space-y-1">
@@ -982,7 +1335,7 @@ export const ProfileSettingsView: React.FC<ProfileSettingsViewProps> = ({
                         Zoom
                       </label>
                       <span className="font-mono tabular-nums text-slate-600 dark:text-[#9FB0C7]">
-                        {cropZoom.toFixed(2)}×
+                        {derivedZoom.toFixed(2)}×
                       </span>
                     </div>
                     <input
@@ -991,8 +1344,8 @@ export const ProfileSettingsView: React.FC<ProfileSettingsViewProps> = ({
                       min={MIN_AVATAR_CROP_ZOOM}
                       max={MAX_AVATAR_CROP_ZOOM}
                       step={0.05}
-                      value={cropZoom}
-                      onChange={(e) => setCropZoom(Number(e.target.value))}
+                      value={Number(derivedZoom.toFixed(2))}
+                      onChange={(e) => handleZoomSliderChange(Number(e.target.value))}
                       className="w-full accent-[#2E7978]"
                     />
                   </div>
@@ -1006,24 +1359,20 @@ export const ProfileSettingsView: React.FC<ProfileSettingsViewProps> = ({
                         Horizontal Position (Left ↔ Right)
                       </label>
                       <span className="font-mono tabular-nums text-slate-600 dark:text-[#9FB0C7]">
-                        {Math.round(cropPanX * 100)}%
+                        {horizontalOffsetPercent}%
                       </span>
                     </div>
                     <input
                       id="avatar-crop-pan-x"
                       type="range"
-                      min={-100}
+                      min={0}
                       max={100}
                       step={1}
-                      disabled={
-                        cropSession.naturalWidth <=
-                        Math.min(cropSession.naturalWidth, cropSession.naturalHeight) /
-                          cropZoom +
-                          0.5
+                      value={horizontalOffsetPercent}
+                      onChange={(e) =>
+                        handleHorizontalSliderChange(Number(e.target.value))
                       }
-                      value={Math.round(cropPanX * 100)}
-                      onChange={(e) => setCropPanX(Number(e.target.value) / 100)}
-                      className="w-full accent-[#0D254C] dark:accent-[#68C7C5] disabled:opacity-40"
+                      className="w-full accent-[#0D254C] dark:accent-[#68C7C5]"
                     />
                   </div>
 
@@ -1036,24 +1385,20 @@ export const ProfileSettingsView: React.FC<ProfileSettingsViewProps> = ({
                         Vertical Position (Top ↕ Bottom)
                       </label>
                       <span className="font-mono tabular-nums text-slate-600 dark:text-[#9FB0C7]">
-                        {Math.round(cropPanY * 100)}%
+                        {verticalOffsetPercent}%
                       </span>
                     </div>
                     <input
                       id="avatar-crop-pan-y"
                       type="range"
-                      min={-100}
+                      min={0}
                       max={100}
                       step={1}
-                      disabled={
-                        cropSession.naturalHeight <=
-                        Math.min(cropSession.naturalWidth, cropSession.naturalHeight) /
-                          cropZoom +
-                          0.5
+                      value={verticalOffsetPercent}
+                      onChange={(e) =>
+                        handleVerticalSliderChange(Number(e.target.value))
                       }
-                      value={Math.round(cropPanY * 100)}
-                      onChange={(e) => setCropPanY(Number(e.target.value) / 100)}
-                      className="w-full accent-[#0D254C] dark:accent-[#68C7C5] disabled:opacity-40"
+                      className="w-full accent-[#0D254C] dark:accent-[#68C7C5]"
                     />
                   </div>
 
