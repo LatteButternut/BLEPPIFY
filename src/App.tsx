@@ -2,6 +2,16 @@
  * @license
  * SPDX-License-Identifier: Apache-2.0
  */
+const handleSignOut = async () => {
+  if (isHydratedRef.current) {
+    await saveCloudAppState(
+      { ...latestStateRef.current, updatedAt: Date.now() },
+      activeUserId
+    );
+  }
+  isHydratedRef.current = false;
+  setIsCloudHydrated(false);
+  // ...rest unchanged
 
 import React, { useState, useEffect, useRef } from 'react';
 import type { Session } from '@supabase/supabase-js';
