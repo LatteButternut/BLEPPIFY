@@ -175,6 +175,7 @@ async function upsertSupabaseUserData(userId: string, payloadState: CloudAppStat
     .upsert({ user_id: userId, data: payloadState }, { onConflict: 'user_id' });
 
   if (!upsertErr) return true;
+  console.error('[BLEPPIFY] user_data upsert failed, trying select/update/insert fallback:', upsertErr);
 
   // Fallback if user_data table does not have a UNIQUE/PK index on user_id for ON CONFLICT
   const { data: existingRow, error: selectErr } = await supabase
@@ -183,18 +184,27 @@ async function upsertSupabaseUserData(userId: string, payloadState: CloudAppStat
     .eq('user_id', userId)
     .maybeSingle();
 
-  if (selectErr) return false;
+  if (selectErr) {
+    console.error('[BLEPPIFY] user_data select failed (check table exists + RLS select policy):', selectErr);
+    return false;
+  }
 
   if (existingRow) {
     const { error: updateErr } = await supabase
       .from('user_data')
       .update({ data: payloadState })
       .eq('user_id', userId);
+    if (updateErr) {
+      console.error('[BLEPPIFY] user_data update failed (check RLS update policy):', updateErr);
+    }
     return !updateErr;
   } else {
     const { error: insertErr } = await supabase
       .from('user_data')
       .insert({ user_id: userId, data: payloadState });
+    if (insertErr) {
+      console.error('[BLEPPIFY] user_data insert failed (check RLS insert policy):', insertErr);
+    }
     return !insertErr;
   }
 }
@@ -219,11 +229,14 @@ export async function loadCloudAppState(userId?: string | null): Promise<CloudAp
         .eq('user_id', resolvedUserId)
         .maybeSingle();
 
+      if (error) {
+        console.error('[BLEPPIFY] user_data load failed (check RLS select policy):', error);
+      }
       if (!error && row && row.data && typeof row.data === 'object') {
         supabaseState = row.data as CloudAppState;
       }
-    } catch {
-      // Fall back to user-scoped IndexedDB if offline
+    } catch (err) {
+      console.error('[BLEPPIFY] user_data load threw, falling back to IndexedDB:', err);
     }
 
     const localState = await readFromIdb(resolvedUserId);
@@ -262,7 +275,8 @@ export async function saveCloudAppState(
       if (ok) return true;
       const lighterState = stripHeavyPdfBase64(state);
       return await upsertSupabaseUserData(resolvedUserId, lighterState);
-    } catch {
+    } catch (err) {
+      console.error('[BLEPPIFY] saveCloudAppState threw:', err);
       return false;
     }
   }
@@ -348,7 +362,3 @@ export async function deleteCloudAccountAndData(
   return { ok: true };
 }
 
-const { error: upsertErr } = await supabase
-  .from('user_data')
-  .upsert({ user_id: userId, data: payloadState }, { onConflict: 'user_id' });
-if (upsertErr) console.error('[user_data upsert failed]', upsertErr);
