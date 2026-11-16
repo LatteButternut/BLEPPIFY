@@ -893,6 +893,10 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
                 domainBoundaryNote: isolationSpec.domainBoundaryNote || '',
                 batchFocusHint: subBatch.batchFocusHint,
                 excludeStems: runningExcludedStems.slice(-25),
+                excludeAnswers: acceptedItems
+                  .map((q) => q.options?.[q.correctChoice] || '')
+                  .filter(Boolean)
+                  .slice(-25),
                 compactMode: false,
               },
               pdfRefs
@@ -909,7 +913,7 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
             const pureSub = mapAndVerifyPureBatch(rawItems, subBatch.batchIndex * 20);
 
             fallbackPureMapped.push(...pureSub);
-            const uniqueSub = deduplicateQuestions(pureSub, runningExcludedStems);
+            const uniqueSub = deduplicateQuestions(pureSub, runningExcludedStems, acceptedItems);
 
             if (uniqueSub.length > 0 && acceptedItems.length < targetQuizSize) {
               const slotsLeft = targetQuizSize - acceptedItems.length;
@@ -956,6 +960,10 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
             excludedSectionsDetails: isolationSpec.excludedSiblingSectionsText || '',
             domainBoundaryNote: isolationSpec.domainBoundaryNote || '',
             excludeStems: runningExcludedStems.slice(-25),
+            excludeAnswers: acceptedItems
+              .map((q) => q.options?.[q.correctChoice] || '')
+              .filter(Boolean)
+              .slice(-25),
             compactMode: false,
           },
           pdfRefs
@@ -968,12 +976,10 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
             500 + topUpAttempt * 50
           );
           fallbackPureMapped.push(...topUpPure);
-          const extraUnique = deduplicateQuestions(topUpPure, runningExcludedStems);
+          const extraUnique = deduplicateQuestions(topUpPure, runningExcludedStems, acceptedItems);
           const slotsLeft = targetQuizSize - acceptedItems.length;
-          const toAdd = (extraUnique.length > 0 ? extraUnique : topUpPure).slice(
-            0,
-            slotsLeft
-          );
+          // Only add genuinely new items; never pad the quiz with repeats
+          const toAdd = extraUnique.slice(0, slotsLeft);
           if (toAdd.length > 0) {
             acceptedItems.push(...toAdd);
             for (const item of toAdd) {
