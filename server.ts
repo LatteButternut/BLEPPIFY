@@ -367,6 +367,11 @@ function getGroqVisionModels(): string[] {
   ]);
 }
 
+function getGroqTemperature(): number {
+  const raw = Number(process.env.GROQ_TEMPERATURE);
+  return Number.isFinite(raw) && raw >= 0 && raw <= 2 ? raw : 1.0;
+}
+
 function groqReasoningEffortFor(model: string): string | undefined {
   // Reasoning tokens count toward output/TPM, so keep them minimal. Only send the field to models that accept it.
   if (model.startsWith('openai/gpt-oss')) return 'low';
@@ -471,7 +476,7 @@ async function callGroqChat(
   const body: Record<string, unknown> = {
     model,
     messages,
-    temperature: 0.4,
+    temperature: getGroqTemperature(),
     max_completion_tokens: maxTokens,
     response_format: {
       type: 'json_schema',
@@ -974,6 +979,81 @@ Return a JSON array of flashcards.`;
   }
 });
 
+// ----------------------------------------------------------------------------
+// Question variety helpers
+// ----------------------------------------------------------------------------
+const OPTION_LETTERS = ['A', 'B', 'C', 'D'] as const;
+
+function optionTokenSet(options: Record<string, unknown> | undefined): Set<string> {
+  const text = OPTION_LETTERS.map((l) => String(options?.[l] ?? '')).join(' ').toLowerCase();
+  return new Set(text.match(/[a-z]{4,}/g) || []);
+}
+
+/** Drops items whose four options are almost the same words as an earlier item in the same batch. */
+function dropNearIdenticalOptionSets(items: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+  const kept: Array<Record<string, unknown>> = [];
+  const keptSets: Array<Set<string>> = [];
+  for (const item of items) {
+    const tokens = optionTokenSet(item.options as Record<string, unknown> | undefined);
+    let duplicate = false;
+    if (tokens.size >= 6) {
+      for (const prev of keptSets) {
+        let inter = 0;
+        for (const t of tokens) if (prev.has(t)) inter++;
+        const union = tokens.size + prev.size - inter;
+        if (union > 0 && inter / union >= 0.6) {
+          duplicate = true;
+          break;
+        }
+      }
+    }
+    if (!duplicate) {
+      kept.push(item);
+      keptSets.push(tokens);
+    }
+  }
+  return kept;
+}
+
+/** Randomizes option order (and remaps the key and rationales) so the keyed answer isn't always in the same slot. */
+function shuffleQuestionOptions(item: Record<string, unknown>): Record<string, unknown> {
+  const options = item.options as Record<string, string> | undefined;
+  const key = String(item.correctChoice);
+  if (!options || !OPTION_LETTERS.includes(key as (typeof OPTION_LETTERS)[number])) return item;
+
+  const texts = OPTION_LETTERS.map((l) => String(options[l] ?? ''));
+  const rationales = (item.optionRationales || {}) as Record<string, string>;
+  const joined = [...texts, ...OPTION_LETTERS.map((l) => String(rationales[l] ?? ''))].join(' ');
+  // Keep the original order when options depend on each other ("all of the above", "both A and B", "Option C", ...)
+  if (/(all|none) of the (above|these)|\b(both|either)\s+[A-D]\b|\b(options?|choices?)\s+[A-D]\b/i.test(joined)) {
+    return item;
+  }
+
+  const order = [0, 1, 2, 3];
+  for (let i = order.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [order[i], order[j]] = [order[j], order[i]];
+  }
+
+  const newOptions: Record<string, string> = {};
+  const newRationales: Record<string, string> = {};
+  let newKey = key;
+  order.forEach((oldIdx, newIdx) => {
+    const newLetter = OPTION_LETTERS[newIdx];
+    const oldLetter = OPTION_LETTERS[oldIdx];
+    newOptions[newLetter] = texts[oldIdx];
+    if (rationales[oldLetter] !== undefined) newRationales[newLetter] = rationales[oldLetter];
+    if (oldLetter === key) newKey = newLetter;
+  });
+
+  return {
+    ...item,
+    options: newOptions,
+    correctChoice: newKey,
+    ...(item.optionRationales ? { optionRationales: newRationales } : {}),
+  };
+}
+
 // 2. Generate 15-Item Practice Quiz / 100-Item 3-Hour Mock Board Exam Questions
 app.post('/api/gemini/questions', async (req, res) => {
   try {
@@ -989,6 +1069,7 @@ app.post('/api/gemini/questions', async (req, res) => {
       domainBoundaryNote = '',
       batchFocusHint = '',
       excludeStems = [],
+      excludeAnswers = [],
       compactMode = false,
       pdfFiles = [],
     } = req.body;
@@ -1052,6 +1133,20 @@ ${excludeStems
 Every item MUST present a 100% fresh angle, scenario, and mutually distinct concept.\n`
         : `\nVARIETY DIRECTIVE: Ensure all ${safeCount} items cover distinct sub-topics, mechanisms, or situational scenarios with zero repetitive stems.\n`;
 
+    const answerExclusionBlock =
+      Array.isArray(excludeAnswers) && excludeAnswers.length > 0
+        ? `\nCORRECT ANSWERS ALREADY USED IN EARLIER ITEMS (do NOT key any new item to these concepts again):\n${excludeAnswers
+            .slice(0, 25)
+            .map((a: unknown) => `- ${String(a).replace(/\s+/g, ' ').trim().slice(0, 110)}`)
+            .join('\n')}\n`
+        : '';
+
+    const varietyDirective = `\nITEM VARIETY RULES (CRITICAL — items that look like copies of each other are rejected):
+- Every item must be keyed to a DIFFERENT concept. Never write two items whose correct answer says the same thing with only the character's name or age changed.
+- Never reuse the same set of four options across items. Distractors must be written fresh for each stem, drawn from different related concepts in scope — not a fixed template such as "normal phase / abnormal behavior / cultural practice / temporary reaction".
+- Vary the item format across the batch: some direct concept questions, some short vignettes, some "which of the following is NOT...", some comparisons. Vary the setting, age, gender, and Filipino context in vignettes.
+- Spread the correct answer across A, B, C and D; do not favor any one letter.${answerExclusionBlock}`;
+
     const lengthDirective = compactMode
       ? 'Keep each optionRationale to 1 crisp sentence and examTip to 1 crisp sentence.'
       : 'Keep each optionRationale to 1–2 sharp, context-specific sentences and examTip to 1–2 sharp sentences anchored to the stem.';
@@ -1068,7 +1163,7 @@ Subject: ${subjectTitle}
 Exam Scope: ${scopeTitle}
 TOS Competencies Covered:
 ${competencyDetails}
-${sectionLockDirective}${batchFocusDirective}${antiRepetitionDirective}
+${sectionLockDirective}${batchFocusDirective}${antiRepetitionDirective}${varietyDirective}
 ${difficultyInstruction}
 ${lengthDirective}
 ${groundingInstruction}
@@ -1162,8 +1257,11 @@ IMPORTANT: NEVER mention "Section A/B/C/D/E/F" or TOS code numbers inside stem, 
 
     const rawText = (response.text ?? '[]').trim();
     const parsedQuestions = JSON.parse(rawText);
-    const questions = Array.isArray(parsedQuestions)
-      ? parsedQuestions.map((item: Record<string, unknown>) => {
+    const variedQuestions = Array.isArray(parsedQuestions)
+      ? dropNearIdenticalOptionSets(parsedQuestions as Array<Record<string, unknown>>).map(shuffleQuestionOptions)
+      : [];
+    const questions = Array.isArray(variedQuestions)
+      ? variedQuestions.map((item: Record<string, unknown>) => {
           const key = ['A', 'B', 'C', 'D'].includes(String(item.correctChoice))
             ? (String(item.correctChoice) as 'A' | 'B' | 'C' | 'D')
             : 'A';
