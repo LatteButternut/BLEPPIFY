@@ -1138,25 +1138,56 @@ export function areStemsTooSimilar(stemA: string, stemB: string): boolean {
   return false;
 }
 
+function optionSetTokens(options: Partial<Record<'A' | 'B' | 'C' | 'D', string>> | undefined): Set<string> {
+  const text = (['A', 'B', 'C', 'D'] as const)
+    .map((l) => String(options?.[l] ?? ''))
+    .join(' ')
+    .toLowerCase();
+  return new Set(text.match(/[a-z]{4,}/g) || []);
+}
+
+/** True when two items use (almost) the same four options, e.g. the same template with a different name in the stem. */
+export function areOptionSetsTooSimilar(
+  a: Partial<Record<'A' | 'B' | 'C' | 'D', string>> | undefined,
+  b: Partial<Record<'A' | 'B' | 'C' | 'D', string>> | undefined
+): boolean {
+  const setA = optionSetTokens(a);
+  const setB = optionSetTokens(b);
+  if (setA.size < 6 || setB.size < 6) return false;
+  let intersection = 0;
+  for (const tok of setA) {
+    if (setB.has(tok)) intersection++;
+  }
+  const union = setA.size + setB.size - intersection;
+  return union > 0 && intersection / union >= 0.6;
+}
+
 /**
  * Removes any incoming questions whose stems repeat or closely paraphrase
- * previously seen stems or earlier items in the same incoming batch.
+ * previously seen stems or earlier items in the same incoming batch. When the
+ * already-accepted items are passed in, items that reuse almost the same four
+ * options as an earlier item are removed too.
  */
-export function deduplicateQuestions<T extends { stem: string }>(
+export function deduplicateQuestions<
+  T extends { stem: string; options?: Partial<Record<'A' | 'B' | 'C' | 'D', string>> }
+>(
   incoming: T[],
-  existingStems: string[]
+  existingStems: string[],
+  existingItems: Array<{ options?: Partial<Record<'A' | 'B' | 'C' | 'D', string>> }> = []
 ): T[] {
   const accepted: T[] = [];
   const referenceStems = [...existingStems];
+  const referenceOptionSets = existingItems.map((q) => q.options);
 
   for (const item of incoming) {
     if (!item?.stem || !item.stem.trim()) continue;
-    const isDup = referenceStems.some((prevStem) =>
-      areStemsTooSimilar(item.stem, prevStem)
-    );
+    const isDup =
+      referenceStems.some((prevStem) => areStemsTooSimilar(item.stem, prevStem)) ||
+      referenceOptionSets.some((prevOptions) => areOptionSetsTooSimilar(item.options, prevOptions));
     if (!isDup) {
       accepted.push(item);
       referenceStems.push(item.stem);
+      referenceOptionSets.push(item.options);
     }
   }
 
