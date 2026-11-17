@@ -1025,7 +1025,8 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
 
   // 3. Generate Subject-Specific 3-Hour Mock Board Exam (130 Items for Psych Assessment, 100 Items for Dev/Abn/IO)
   const handleGenerateMockExam100 = async () => {
-    const batches = buildMockExamSectionBatches(subject.sections, subjectMockSize, 25);
+    // Small batches keep every AI request short and under per-minute token limits
+    const batches = buildMockExamSectionBatches(subject.sections, subjectMockSize, 6);
     setIsGenerating(true);
     setGenError(null);
     setGenBanner(
@@ -1034,7 +1035,7 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
 
     try {
       const pdfRefs = await preparePdfRefsForApi();
-      const accumulated: BoardQuestionItem[] = [];
+      const itemsByBatch = new Map<number, BoardQuestionItem[]>();
       const runningExcludedStems: string[] = Array.from(
         new Set([
           ...seenStems,
@@ -1042,70 +1043,94 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
           ...subject.seedQuestions.map((q) => q.stem),
         ])
       );
+      const countReady = () =>
+        Array.from(itemsByBatch.values()).reduce((sum, list) => sum + list.length, 0);
 
-      // Process up to 4 section batches concurrently for fast mock exam generation
-      for (let i = 0; i < batches.length; i += 4) {
-        const wave = batches.slice(i, i + 4);
-        const waveResults = await Promise.all(
-          wave.map(async (batch) => {
-            const { title, details } = resolveScopeDescription(batch.sectionId);
-            const batchIsolation = buildStrictSectionIsolationSpec(
-              subject.id,
-              subject.sections,
-              batch.sectionId
-            );
-            const res = await postGeminiJsonWithPdfRetry(
-              '/api/gemini/questions',
-              {
-                subjectTitle: subject.fullTitle,
-                scopeTitle: title,
-                competencyDetails: details,
-                count: batch.count,
-                difficultyFilter,
-                lockedSectionLetter: batch.sectionLetter,
-                lockedSectionTitle: batch.sectionTitle,
-                excludedSectionsDetails: batchIsolation.excludedSiblingSectionsText || '',
-                domainBoundaryNote: batchIsolation.domainBoundaryNote || '',
-                excludeStems: runningExcludedStems.slice(-25),
-                compactMode: true,
-              },
-              pdfRefs
-            );
-
-            if (!res.ok) {
-              const err = await res.json().catch(() => ({}));
-              throw new Error(err.error || `Failed on Mock Exam batch ${batch.batchIndex}.`);
-            }
-
-            const payload = await res.json();
-            const rawArr = Array.isArray(payload.questions) ? payload.questions : [];
-            return rawArr
-              .slice(0, batch.count)
-              .map((q: any, idx: number) =>
-                mapRawQuestion(
-                  q,
-                  batch.batchIndex * 100 + idx,
-                  title,
-                  batch.sectionLetter
-                )
-              );
-          })
+      const runBatch = async (batch: (typeof batches)[number]): Promise<BoardQuestionItem[]> => {
+        const { title, details } = resolveScopeDescription(batch.sectionId);
+        const batchIsolation = buildStrictSectionIsolationSpec(
+          subject.id,
+          subject.sections,
+          batch.sectionId
+        );
+        const res = await postGeminiJsonWithPdfRetry(
+          '/api/gemini/questions',
+          {
+            subjectTitle: subject.fullTitle,
+            scopeTitle: title,
+            competencyDetails: details,
+            count: batch.count,
+            difficultyFilter,
+            lockedSectionLetter: batch.sectionLetter,
+            lockedSectionTitle: batch.sectionTitle,
+            excludedSectionsDetails: batchIsolation.excludedSiblingSectionsText || '',
+            domainBoundaryNote: batchIsolation.domainBoundaryNote || '',
+            excludeStems: runningExcludedStems.slice(-25),
+            compactMode: true,
+          },
+          pdfRefs
         );
 
-        for (const items of waveResults) {
-          for (const item of items) {
-            accumulated.push(item);
-            runningExcludedStems.push(item.stem);
-          }
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.error || `Failed on Mock Exam batch ${batch.batchIndex}.`);
         }
 
-        setGenBanner(
-          `Generating ${subjectMockSize}-Item 3-Hour BLEPP Mock Exam (${Math.min(
-            subjectMockSize,
-            accumulated.length
-          )} / ${subjectMockSize} items ready)...`
+        const payload = await res.json();
+        const rawArr = Array.isArray(payload.questions) ? payload.questions : [];
+        return rawArr
+          .slice(0, batch.count)
+          .map((q: any, idx: number) =>
+            mapRawQuestion(q, batch.batchIndex * 100 + idx, title, batch.sectionLetter)
+          );
+      };
+
+      // Up to 3 batches at a time; failed batches (rate limits, malformed AI output) are retried
+      // in later rounds instead of failing the whole exam.
+      let pending = [...batches];
+      let lastBatchError = '';
+      for (let round = 0; round < 4 && pending.length > 0; round++) {
+        if (round > 0) {
+          setGenBanner(
+            `The AI service is busy. Retrying ${pending.length} batch(es) in a moment (${countReady()} / ${subjectMockSize} items ready)...`
+          );
+          await new Promise((resolve) => setTimeout(resolve, round * 12000));
+        }
+
+        const stillPending: typeof pending = [];
+        for (let i = 0; i < pending.length; i += 3) {
+          const wave = pending.slice(i, i + 3);
+          const settled = await Promise.allSettled(wave.map((batch) => runBatch(batch)));
+          settled.forEach((result, idx) => {
+            if (result.status === 'fulfilled') {
+              itemsByBatch.set(wave[idx].batchIndex, result.value);
+              for (const item of result.value) runningExcludedStems.push(item.stem);
+            } else {
+              stillPending.push(wave[idx]);
+              lastBatchError =
+                result.reason instanceof Error ? result.reason.message : String(result.reason);
+            }
+          });
+
+          setGenBanner(
+            `Generating ${subjectMockSize}-Item 3-Hour BLEPP Mock Exam (${Math.min(
+              subjectMockSize,
+              countReady()
+            )} / ${subjectMockSize} items ready)...`
+          );
+        }
+        pending = stillPending;
+      }
+
+      if (pending.length > 0) {
+        throw new Error(
+          `Only ${countReady()} of ${subjectMockSize} items could be generated because the AI service kept failing (${lastBatchError || 'unknown error'}). Please wait a minute and try again.`
         );
       }
+
+      const accumulated: BoardQuestionItem[] = Array.from(itemsByBatch.entries())
+        .sort((x, y) => x[0] - y[0])
+        .flatMap(([, list]) => list);
 
       const finalMockItems = accumulated.slice(0, subjectMockSize);
       onRecordSeenStems(finalMockItems.map((q) => q.stem));
