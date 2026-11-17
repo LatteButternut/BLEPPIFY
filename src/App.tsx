@@ -584,6 +584,34 @@ export default function App() {
     }));
   };
 
+  // Removes saved answer history for the given questions so daily progress, Subject Analysis and the
+  // GWA Calculator stop counting them (used by "Clear Quiz").
+  const handleRemoveAttemptsForQuestions = (questionIds: string[]) => {
+    if (questionIds.length === 0) return;
+    const idSet = new Set(questionIds);
+    setCloudState((prev) => ({
+      ...prev,
+      updatedAt: Date.now(),
+      attemptLogs: prev.attemptLogs.filter((log) => !idSet.has(log.questionId)),
+    }));
+  };
+
+  const handleUnmarkCompetencies = (compIds: string[]) => {
+    if (compIds.length === 0) return;
+    setCloudState((prev) => {
+      const nextMastered = { ...prev.masteredCompetencies };
+      let changed = false;
+      for (const id of compIds) {
+        if (nextMastered[id]) {
+          delete nextMastered[id];
+          changed = true;
+        }
+      }
+      if (!changed) return prev;
+      return { ...prev, updatedAt: Date.now(), masteredCompetencies: nextMastered };
+    });
+  };
+
   const handleMarkCompetenciesMastered = (compIds: string[]) => {
     if (compIds.length === 0) return;
     setCloudState((prev) => {
@@ -1055,6 +1083,8 @@ export default function App() {
             masteredCompetencies={cloudState.masteredCompetencies}
             onToggleCompetency={handleToggleCompetency}
             onMarkCompetenciesMastered={handleMarkCompetenciesMastered}
+            onUnmarkCompetencies={handleUnmarkCompetencies}
+            onRemoveAttemptsForQuestions={handleRemoveAttemptsForQuestions}
             onSaveProgressNow={handleSaveCloudProgressNow}
             onNavigateToAnalytics={() => setActiveTab('analytics')}
             seenStems={cloudState.seenStemsBySubject?.[activeTab] || []}
