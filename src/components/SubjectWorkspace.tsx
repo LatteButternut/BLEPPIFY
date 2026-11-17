@@ -88,6 +88,8 @@ interface SubjectWorkspaceProps {
   masteredCompetencies: Record<string, boolean>;
   onToggleCompetency: (compId: string) => void;
   onMarkCompetenciesMastered: (compIds: string[]) => void;
+  onUnmarkCompetencies: (compIds: string[]) => void;
+  onRemoveAttemptsForQuestions: (questionIds: string[]) => void;
   onSaveProgressNow: () => Promise<boolean>;
   onNavigateToAnalytics: () => void;
   seenStems: string[];
@@ -124,6 +126,8 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
   masteredCompetencies,
   onToggleCompetency,
   onMarkCompetenciesMastered,
+  onUnmarkCompetencies,
+  onRemoveAttemptsForQuestions,
   onSaveProgressNow,
   onNavigateToAnalytics,
   seenStems,
@@ -2236,6 +2240,10 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
                       const quizIds = new Set(
                         practiceDisplayedQuestions.map((q) => q.id)
                       );
+                      // Also remove this quiz's saved answers and the goals it cleared, so daily progress,
+                      // Subject Analysis and the GWA Calculator no longer count it.
+                      onRemoveAttemptsForQuestions(Array.from(quizIds));
+                      onUnmarkCompetencies(quizEval.clearedCompetencyIds);
                       onUpdateQuestions(questions.filter((q) => !quizIds.has(q.id)));
                       onUpdateSessionProgress((prev) => ({
                         ...prev,
