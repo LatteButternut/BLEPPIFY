@@ -70,6 +70,7 @@ interface ProfileSettingsViewProps {
   onSaveProfile: (payload: ProfileSettingsUpdatePayload) => void;
   onApplyAvatar?: (nextAvatar: string | null) => void;
   onBackToHome: () => void;
+  onResetProgress: () => void;
   onDeleteAccount: () => Promise<{ ok: boolean; error?: string }>;
 }
 
@@ -321,6 +322,7 @@ export const ProfileSettingsView: React.FC<ProfileSettingsViewProps> = ({
   onSaveProfile,
   onApplyAvatar,
   onBackToHome,
+  onResetProgress,
   onDeleteAccount,
 }) => {
   const [nameDraft, setNameDraft] = useState<string>(profileName || '');
@@ -368,6 +370,9 @@ export const ProfileSettingsView: React.FC<ProfileSettingsViewProps> = ({
   } | null>(null);
 
   // Account deletion confirmation states
+  const [isResetExpanded, setIsResetExpanded] = useState<boolean>(false);
+  const [resetConfirmText, setResetConfirmText] = useState<string>('');
+  const [resetDone, setResetDone] = useState<boolean>(false);
   const [isDeleteExpanded, setIsDeleteExpanded] = useState<boolean>(false);
   const [deleteConfirmText, setDeleteConfirmText] = useState<string>('');
   const [isDeletingAccount, setIsDeletingAccount] = useState<boolean>(false);
@@ -1880,6 +1885,96 @@ export const ProfileSettingsView: React.FC<ProfileSettingsViewProps> = ({
                 <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
               )}
               <span>{passwordUpdateStatus.message}</span>
+            </div>
+          )}
+        </div>
+      </section>
+
+      {/* RESET PROGRESS: clears study data but keeps the account, profile and PDFs */}
+      <section
+        aria-label="Reset Progress"
+        className="bg-white dark:bg-[#131F33] border border-amber-200/90 dark:border-amber-900/60 rounded-xl overflow-hidden transition-colors"
+      >
+        <div className="p-5 sm:p-6 space-y-4">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+            <div className="space-y-1">
+              <h2 className="text-lg font-display font-semibold text-amber-800 dark:text-amber-300">
+                Reset Progress
+              </h2>
+              <p className="text-xs text-slate-600 dark:text-[#9FB0C8] max-w-xl">
+                Clears your grades, cleared goals, saved quizzes and flashcards, and answer history. Your account,
+                name, photo, exam date, goals and uploaded PDFs are kept.
+              </p>
+            </div>
+
+            {!isResetExpanded && (
+              <button
+                type="button"
+                onClick={() => {
+                  setIsResetExpanded(true);
+                  setResetConfirmText('');
+                  setResetDone(false);
+                }}
+                className="self-start sm:self-center min-h-[42px] inline-flex items-center gap-2 px-4 py-2 rounded-lg border border-amber-300 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/40 hover:bg-amber-100 dark:hover:bg-amber-950/70 text-xs font-semibold text-amber-800 dark:text-amber-200 transition-colors whitespace-nowrap shrink-0"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                <span>Reset Progress</span>
+              </button>
+            )}
+          </div>
+
+          {resetDone && !isResetExpanded && (
+            <div className="p-3 rounded-lg bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 text-xs text-emerald-800 dark:text-emerald-200">
+              Progress reset. You can now generate fresh quizzes and flashcards.
+            </div>
+          )}
+
+          {isResetExpanded && (
+            <div className="pt-4 border-t border-amber-200/70 dark:border-amber-900/50 space-y-4">
+              <div className="space-y-1.5 max-w-sm">
+                <label
+                  htmlFor="reset-progress-confirm"
+                  className="block text-xs font-semibold text-amber-900 dark:text-amber-200"
+                >
+                  Type <span className="font-mono font-bold">RESET</span> to confirm
+                </label>
+                <input
+                  id="reset-progress-confirm"
+                  type="text"
+                  autoComplete="off"
+                  placeholder="RESET"
+                  value={resetConfirmText}
+                  onChange={(e) => setResetConfirmText(e.target.value)}
+                  className="w-full min-h-[42px] px-3.5 py-2 text-base sm:text-sm font-mono bg-[#F8FAFC] dark:bg-[#0F1A2C] text-[#0F172A] dark:text-[#F8FAFC] border border-amber-300 dark:border-amber-800 rounded-lg focus:border-amber-600 dark:focus:border-amber-400 focus:outline-none"
+                />
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2.5">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsResetExpanded(false);
+                    setResetConfirmText('');
+                  }}
+                  className="min-h-[42px] px-4 py-2 rounded-lg border border-slate-300 dark:border-[#293D5C] bg-white dark:bg-[#131F33] hover:bg-slate-50 dark:hover:bg-[#1A2942] text-xs font-semibold text-slate-700 dark:text-[#E6ECF5] transition-colors whitespace-nowrap"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  disabled={resetConfirmText.trim().toUpperCase() !== 'RESET'}
+                  onClick={() => {
+                    onResetProgress();
+                    setIsResetExpanded(false);
+                    setResetConfirmText('');
+                    setResetDone(true);
+                  }}
+                  className="min-h-[42px] inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white text-xs font-semibold transition-colors whitespace-nowrap"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>Reset All Progress</span>
+                </button>
+              </div>
             </div>
           )}
         </div>
