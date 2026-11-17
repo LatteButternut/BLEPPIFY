@@ -372,10 +372,14 @@ function getGroqTemperature(): number {
   return Number.isFinite(raw) && raw >= 0 && raw <= 2 ? raw : 1.0;
 }
 
-function groqReasoningEffortFor(model: string): string | undefined {
-  // Reasoning tokens count toward output/TPM, so keep them minimal. Only send the field to models that accept it.
-  if (model.startsWith('openai/gpt-oss')) return 'low';
-  if (model.startsWith('qwen/qwen3.8')) return 'none';
+function groqReasoningEffortFor(model: string, thorough = false): string | undefined {
+  // Reasoning tokens count toward output/TPM, so keep them small on the free plan.
+  // Set GROQ_QUESTION_REASONING=medium (or high) on a paid Groq plan for more accurate answer keys.
+  // Only send the field to models that accept it.
+  const override = (process.env.GROQ_QUESTION_REASONING || '').trim().toLowerCase();
+  const validOverride = ['low', 'medium', 'high'].includes(override) ? override : '';
+  if (model.startsWith('openai/gpt-oss')) return thorough && validOverride ? validOverride : 'low';
+  if (model.startsWith('qwen/qwen3.8')) return thorough ? validOverride || 'low' : 'none';
   return undefined;
 }
 
@@ -471,7 +475,8 @@ async function callGroqChat(
   messages: unknown[],
   schema: Record<string, unknown>,
   maxTokens: number,
-  timeoutMs: number
+  timeoutMs: number,
+  thorough = false
 ): Promise<string> {
   const body: Record<string, unknown> = {
     model,
@@ -483,7 +488,7 @@ async function callGroqChat(
       json_schema: { name: 'bleppify_response', strict: true, schema },
     },
   };
-  const effort = groqReasoningEffortFor(model);
+  const effort = groqReasoningEffortFor(model, thorough);
   if (effort) body.reasoning_effort = effort;
 
   const res = await fetch(GROQ_API_URL, {
@@ -530,7 +535,8 @@ async function generateWithGroq(
   contents: { parts: PartInput[] },
   config: Record<string, unknown>,
   timeoutMs: number,
-  maxTokens: number
+  maxTokens: number,
+  thorough = false
 ): Promise<{ text: string }> {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const rawSchema = config.responseSchema as any;
@@ -598,7 +604,7 @@ async function generateWithGroq(
       const cooldownKey = `groq:${model}`;
       try {
         const content = await withGroqSlot(() =>
-          callGroqChat(model, messages, schema, maxTokens, timeoutMs)
+          callGroqChat(model, messages, schema, maxTokens, timeoutMs, thorough)
         );
         modelCooldownUntil.delete(cooldownKey);
         if (!rootIsArray) {
@@ -649,10 +655,10 @@ async function generateWithFallback(
   contents: { parts: PartInput[] },
   config: Record<string, unknown>,
   preferLowThinkingLatency = false,
-  opts: { maxTokens?: number } = {}
+  opts: { maxTokens?: number; thorough?: boolean } = {}
 ): Promise<{ text?: string }> {
   if (ai.provider === 'groq') {
-    return generateWithGroq(contents, config, ai.timeoutMs, opts.maxTokens ?? 4000);
+    return generateWithGroq(contents, config, ai.timeoutMs, opts.maxTokens ?? 4000, Boolean(opts.thorough));
   }
   const geminiClient = ai.gemini as GoogleGenAI;
   const candidates = preferLowThinkingLatency ? FAST_JSON_MODELS : VISION_MODELS;
@@ -1147,6 +1153,12 @@ Every item MUST present a 100% fresh angle, scenario, and mutually distinct conc
 - Vary the item format across the batch: some direct concept questions, some short vignettes, some "which of the following is NOT...", some comparisons. Vary the setting, age, gender, and Filipino context in vignettes.
 - Spread the correct answer across A, B, C and D; do not favor any one letter.${answerExclusionBlock}`;
 
+    const accuracyDirective = `\nACCURACY SELF-CHECK (do this silently for EVERY item before you finish it; a wrong key is the worst possible error):
+- Re-read the stem and list every detail that rules options in or out. Example: if twins are "raised apart" in different environments, an explanation that depends on a shared rearing home (such as passive gene–environment correlation) cannot be the answer.
+- Exactly ONE option may be defensible according to standard Philippine psychometrician review sources and mainstream textbooks. If two options could both be argued, rewrite the stem or the distractor.
+- Write the rationales first, then set correctChoice to the option your rationales and examTip name as best. The rationale for the keyed option must say why it is right, and every other rationale must say why it is wrong for THIS stem.
+- Do not key an option that needs an assumption the stem does not state.`;
+
     const lengthDirective = compactMode
       ? 'Keep each optionRationale to 1 crisp sentence and examTip to 1 crisp sentence.'
       : 'Keep each optionRationale to 1–2 sharp, context-specific sentences and examTip to 1–2 sharp sentences anchored to the stem.';
@@ -1163,7 +1175,7 @@ Subject: ${subjectTitle}
 Exam Scope: ${scopeTitle}
 TOS Competencies Covered:
 ${competencyDetails}
-${sectionLockDirective}${batchFocusDirective}${antiRepetitionDirective}${varietyDirective}
+${sectionLockDirective}${batchFocusDirective}${antiRepetitionDirective}${varietyDirective}${accuracyDirective}
 ${difficultyInstruction}
 ${lengthDirective}
 ${groundingInstruction}
@@ -1207,10 +1219,6 @@ IMPORTANT: NEVER mention "Section A/B/C/D/E/F" or TOS code numbers inside stem, 
                 },
                 required: ['A', 'B', 'C', 'D'],
               },
-              correctChoice: {
-                type: Type.STRING,
-                description: '"A", "B", "C", or "D".',
-              },
               sectionCode: {
                 type: Type.STRING,
                 description: 'Single uppercase letter: "A", "B", "C", "D", "E", or "F".',
@@ -1237,22 +1245,28 @@ IMPORTANT: NEVER mention "Section A/B/C/D/E/F" or TOS code numbers inside stem, 
                 type: Type.STRING,
                 description: 'Context-grounded summary of why the keyed choice is the best fit over look-alike options in this stem.',
               },
+              // Keep correctChoice LAST: the model writes its reasoning (rationales + exam tip) first,
+              // then commits to the key, which makes wrong keys less likely.
+              correctChoice: {
+                type: Type.STRING,
+                description: '"A", "B", "C", or "D". Must be the option that your optionRationales and examTip identify as best.',
+              },
             },
             required: [
               'stem',
               'options',
-              'correctChoice',
               'sectionCode',
               'tosCode',
               'bloomsLevel',
               'optionRationales',
               'examTip',
+              'correctChoice',
             ],
           },
         },
       },
       true,
-      { maxTokens: 1400 + safeCount * 650 }
+      { maxTokens: 1600 + safeCount * 650, thorough: true }
     );
 
     const rawText = (response.text ?? '[]').trim();
