@@ -473,6 +473,27 @@ export default function App() {
     }));
   };
 
+  // Clears study progress (grades, mastered goals, saved quizzes/flashcards, history) but keeps
+  // the profile, settings, exam date, goals and uploaded PDF reviewers.
+  const handleResetProgress = () => {
+    setCloudState((prev) => {
+      const fresh = createDefaultCloudState(prev.theme || 'light');
+      return {
+        ...fresh,
+        theme: prev.theme,
+        examDate: prev.examDate,
+        profileName: prev.profileName,
+        profileAvatar: prev.profileAvatar,
+        dailyQuestionGoal: prev.dailyQuestionGoal,
+        topnotcherMode: prev.topnotcherMode,
+        topnotcherThreshold: prev.topnotcherThreshold,
+        pdfsBySubject: prev.pdfsBySubject,
+        // A fresh timestamp makes sure an older saved copy can never overwrite the reset
+        updatedAt: Date.now(),
+      };
+    });
+  };
+
   const handleDeleteAccount = async (): Promise<{ ok: boolean; error?: string }> => {
     isHydratedRef.current = false;
     const storageKey = getScopedLocalStorageKey(activeUserId);
@@ -1013,6 +1034,7 @@ export default function App() {
             onSaveProfile={handleSaveProfileSettings}
             onApplyAvatar={handleApplyProfileAvatar}
             onBackToHome={() => setActiveTab('overview')}
+            onResetProgress={handleResetProgress}
             onDeleteAccount={handleDeleteAccount}
           />
         ) : (
