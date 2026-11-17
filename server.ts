@@ -625,6 +625,9 @@ async function generateWithGroq(
             modelCooldownUntil.set(cooldownKey, Date.now() + waitSec * 1000);
           } else if (err.status === 413) {
             modelCooldownUntil.set(cooldownKey, Date.now() + 10_000);
+          } else if (err.status === 400 && /failed to generate json/i.test(err.message)) {
+            // The model produced malformed/truncated JSON: transient, so try the next model right away
+            modelCooldownUntil.set(cooldownKey, Date.now() + 5_000);
           } else {
             modelCooldownUntil.set(cooldownKey, Date.now() + 2 * 60 * 1000);
           }
@@ -646,6 +649,9 @@ async function generateWithGroq(
     throw new Error(
       'Groq rate limit reached (the free plan allows roughly 8,000 tokens per minute per model). Please wait a minute and try again, or upgrade your Groq plan.'
     );
+  }
+  if (lastError instanceof GroqHttpError && /failed to generate json/i.test(lastError.message)) {
+    throw new Error('The AI model returned malformed output for this batch. Please try again.');
   }
   throw lastError instanceof Error ? lastError : new Error('Groq request failed.');
 }
@@ -1266,7 +1272,7 @@ IMPORTANT: NEVER mention "Section A/B/C/D/E/F" or TOS code numbers inside stem, 
         },
       },
       true,
-      { maxTokens: 1600 + safeCount * 650, thorough: true }
+      { maxTokens: compactMode ? 1200 + safeCount * 450 : 1600 + safeCount * 650, thorough: true }
     );
 
     const rawText = (response.text ?? '[]').trim();
