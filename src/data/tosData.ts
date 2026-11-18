@@ -54,6 +54,8 @@ export interface BoardQuestionItem {
     D: string;
   };
   examTip?: string;
+  /** The specific sub-concept this item tests (used to keep items distinct from each other). */
+  focusConcept?: string;
   adaptiveTips?: {
     correctTip?: string;
     misconceptionTips?: {
