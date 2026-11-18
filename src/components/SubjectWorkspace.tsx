@@ -619,6 +619,7 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
         'Aligned with PRC Annex B TOS.',
       optionRationales: optRationales,
       examTip: q.examTip ? String(q.examTip).trim() : undefined,
+      focusConcept: typeof q.focusConcept === 'string' && q.focusConcept.trim() ? q.focusConcept.trim() : undefined,
       adaptiveTips: q.adaptiveTips
         ? {
             correctTip: q.adaptiveTips.correctTip || undefined,
@@ -901,6 +902,10 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
                   .map((q) => q.options?.[q.correctChoice] || '')
                   .filter(Boolean)
                   .slice(-25),
+                excludeConcepts: acceptedItems
+                  .map((q) => q.focusConcept || '')
+                  .filter(Boolean)
+                  .slice(-30),
                 compactMode: false,
               },
               pdfRefs
@@ -968,6 +973,10 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
               .map((q) => q.options?.[q.correctChoice] || '')
               .filter(Boolean)
               .slice(-25),
+            excludeConcepts: acceptedItems
+              .map((q) => q.focusConcept || '')
+              .filter(Boolean)
+              .slice(-30),
             compactMode: false,
           },
           pdfRefs
