@@ -1005,6 +1005,7 @@ function optionTokenSet(options: Record<string, unknown> | undefined): Set<strin
 function dropNearIdenticalOptionSets(items: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
   const kept: Array<Record<string, unknown>> = [];
   const keptSets: Array<Set<string>> = [];
+  const keptConcepts: Array<Set<string>> = [];
   for (const item of items) {
     const tokens = optionTokenSet(item.options as Record<string, unknown> | undefined);
     let duplicate = false;
@@ -1019,9 +1020,29 @@ function dropNearIdenticalOptionSets(items: Array<Record<string, unknown>>): Arr
         }
       }
     }
+    // Same specific concept written twice in one batch (even with different options) is also a repeat
+    if (!duplicate && typeof item.focusConcept === 'string' && item.focusConcept.trim()) {
+      const conceptTokens = new Set(
+        item.focusConcept.toLowerCase().match(/[a-z]{4,}/g) || []
+      );
+      if (conceptTokens.size >= 3) {
+        for (const prevConcept of keptConcepts) {
+          let inter = 0;
+          for (const t of conceptTokens) if (prevConcept.has(t)) inter++;
+          const union = conceptTokens.size + prevConcept.size - inter;
+          if (union > 0 && inter / union >= 0.7) {
+            duplicate = true;
+            break;
+          }
+        }
+      }
+    }
     if (!duplicate) {
       kept.push(item);
       keptSets.push(tokens);
+      keptConcepts.push(
+        new Set(String(item.focusConcept || '').toLowerCase().match(/[a-z]{4,}/g) || [])
+      );
     }
   }
   return kept;
@@ -1082,6 +1103,7 @@ app.post('/api/gemini/questions', async (req, res) => {
       batchFocusHint = '',
       excludeStems = [],
       excludeAnswers = [],
+      excludeConcepts = [],
       compactMode = false,
       pdfFiles = [],
     } = req.body;
@@ -1153,6 +1175,24 @@ Every item MUST present a 100% fresh angle, scenario, and mutually distinct conc
             .join('\n')}\n`
         : '';
 
+    const conceptExclusionBlock =
+      Array.isArray(excludeConcepts) && excludeConcepts.length > 0
+        ? `\nSPECIFIC CONCEPTS ALREADY TESTED (choose a different focusConcept for every new item):\n${excludeConcepts
+            .slice(0, 30)
+            .map((c: unknown) => `- ${String(c).replace(/\s+/g, ' ').trim().slice(0, 90)}`)
+            .join('\n')}\n`
+        : '';
+
+    const bloomsDirective = `\nBLOOM'S LEVEL WRITING RULES (the bloomsLevel label must be TRUE to how the item is written — an item labeled with a higher level that only asks the student to spot a keyword is rejected):
+- Remembering: ask for direct recall of a term, definition, name, criterion or fact. Short stem (1–2 lines), NO vignette. Options are terms or definitions. Easy.
+- Understanding: ask the student to explain, classify, paraphrase, or pick the best example of a concept. Short stem, no long story. Easy.
+- Applying: give a short case and require applying a named rule, criterion, technique or principle to reach a result. Moderate.
+- Analyzing: require breaking a case or concept into parts, comparing or differentiating look-alike concepts, or identifying which cue/evidence supports which conclusion. Options are differences, relationships or evidence, not just labels. Difficult.
+- Evaluating: require judging, justifying or critiquing a decision, interpretation, finding or approach against criteria (for example "which conclusion is best supported", "which approach is most defensible", "what is the flaw"). Difficult.
+- Creating: require proposing, formulating or designing a plan, hypothesis, response or tool. Difficult.
+- Items at different levels must LOOK different: vary stem length, format and the question verb. Do NOT write every item as the same "a person shows X; which factor indicates Y?" vignette.
+- Follow the competency verbs in the TOS text above (Recognize/Identify = Remembering, Explain/Describe/Illustrate = Understanding, Apply/Employ = Applying, Analyze/Differentiate/Compare = Analyzing, Evaluate/Assess/Appraise = Evaluating, Formulate/Develop = Creating) and any level named in the sub-batch assignment.${conceptExclusionBlock}`;
+
     const varietyDirective = `\nITEM VARIETY RULES (CRITICAL — items that look like copies of each other are rejected):
 - Every item must be keyed to a DIFFERENT concept. Never write two items whose correct answer says the same thing with only the character's name or age changed.
 - Never reuse the same set of four options across items. Distractors must be written fresh for each stem, drawn from different related concepts in scope — not a fixed template such as "normal phase / abnormal behavior / cultural practice / temporary reaction".
@@ -1181,13 +1221,14 @@ Subject: ${subjectTitle}
 Exam Scope: ${scopeTitle}
 TOS Competencies Covered:
 ${competencyDetails}
-${sectionLockDirective}${batchFocusDirective}${antiRepetitionDirective}${varietyDirective}${accuracyDirective}
+${sectionLockDirective}${batchFocusDirective}${antiRepetitionDirective}${varietyDirective}${bloomsDirective}${accuracyDirective}
 ${difficultyInstruction}
 ${lengthDirective}
 ${groundingInstruction}
 
 Generate exactly ${safeCount} multiple-choice board exam items.
-For each item:
+For each item, fill the fields in this order:
+0. focusConcept: a short phrase (max 12 words) naming the ONE specific sub-concept or skill this item tests. It must differ from every other item's focusConcept. Then choose bloomsLevel, then write the stem in the form that level requires.
 1. options: 4 realistic choices (A, B, C, D) with plausible look-alike distractors${cleanLockedLetter ? ` strictly belonging to Section ${cleanLockedLetter}` : ''}.
 2. correctChoice: "A", "B", "C", or "D".
 3. sectionCode: ${cleanLockedLetter ? `"${cleanLockedLetter}"` : '"A", "B", "C", "D", "E", or "F"'}.
@@ -1211,6 +1252,15 @@ IMPORTANT: NEVER mention "Section A/B/C/D/E/F" or TOS code numbers inside stem, 
           items: {
             type: Type.OBJECT,
             properties: {
+              focusConcept: {
+                type: Type.STRING,
+                description: 'Max 12 words: the ONE specific sub-concept or skill this item tests. Different for every item.',
+              },
+              // bloomsLevel is chosen BEFORE the stem so the stem is written in that level's form
+              bloomsLevel: {
+                type: Type.STRING,
+                description: 'Remembering, Understanding, Applying, Analyzing, Evaluating, or Creating. The stem must be written to genuinely require this level.',
+              },
               stem: {
                 type: Type.STRING,
                 description: 'The board exam question stem or situational vignette.',
@@ -1232,10 +1282,6 @@ IMPORTANT: NEVER mention "Section A/B/C/D/E/F" or TOS code numbers inside stem, 
               tosCode: {
                 type: Type.STRING,
                 description: 'Specific TOS identifier.',
-              },
-              bloomsLevel: {
-                type: Type.STRING,
-                description: 'Remembering, Understanding, Applying, Analyzing, Evaluating, or Creating.',
               },
               optionRationales: {
                 type: Type.OBJECT,
@@ -1259,11 +1305,12 @@ IMPORTANT: NEVER mention "Section A/B/C/D/E/F" or TOS code numbers inside stem, 
               },
             },
             required: [
+              'focusConcept',
+              'bloomsLevel',
               'stem',
               'options',
               'sectionCode',
               'tosCode',
-              'bloomsLevel',
               'optionRationales',
               'examTip',
               'correctChoice',
