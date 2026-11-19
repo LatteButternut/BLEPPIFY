@@ -1307,7 +1307,7 @@ For each item, fill the fields in this order:
 1. options: 4 realistic choices (A, B, C, D) with plausible look-alike distractors${cleanLockedLetter ? ` strictly belonging to Section ${cleanLockedLetter}` : ''}.
 2. correctChoice: "A", "B", "C", or "D".
 3. sectionCode: ${cleanLockedLetter ? `"${cleanLockedLetter}"` : '"A", "B", "C", "D", "E", or "F"'}.
-4. tosCode: exact TOS code label.
+4. tosCode: the competency number (like "1.1" or "2.3") copied exactly from the TOS competency list above that this item actually tests. Mastery percentages are computed from it, so never guess or leave it generic.
 5. bloomsLevel: "Remembering", "Understanding", "Applying", "Analyzing", "Evaluating", or "Creating".
 6. optionRationales (A, B, C, D):
    - For correctChoice: explain WHY it is the BEST answer based on the exact contextual cues in the stem.
@@ -1356,7 +1356,7 @@ IMPORTANT: NEVER mention "Section A/B/C/D/E/F" or TOS code numbers inside stem, 
               },
               tosCode: {
                 type: Type.STRING,
-                description: 'Specific TOS identifier.',
+                description: 'The competency number exactly as listed in the TOS competencies above (for example "1.1" or "2.3") for the ONE competency this item tests.',
               },
               optionRationales: {
                 type: Type.OBJECT,
