@@ -43,6 +43,9 @@ import {
   deduplicateFlashcards,
   deduplicateQuestions,
   evaluateQuizCompletionAndSectionGoals,
+  computeMasteryStats,
+  COMPETENCY_MASTERY_THRESHOLD_PERCENT,
+  COMPETENCY_MASTERY_MIN_ITEMS,
   ExamAnswerKeyItem,
   filterPureLockedSectionQuestions,
   filterQuestionsStrictByScope,
@@ -88,6 +91,7 @@ interface SubjectWorkspaceProps {
   masteredCompetencies: Record<string, boolean>;
   onToggleCompetency: (compId: string) => void;
   onMarkCompetenciesMastered: (compIds: string[]) => void;
+  attemptLogs: QuestionAttemptLog[];
   onUnmarkCompetencies: (compIds: string[]) => void;
   onRemoveAttemptsForQuestions: (questionIds: string[]) => void;
   onSaveProgressNow: () => Promise<boolean>;
@@ -126,6 +130,7 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
   masteredCompetencies,
   onToggleCompetency,
   onMarkCompetenciesMastered,
+  attemptLogs,
   onUnmarkCompetencies,
   onRemoveAttemptsForQuestions,
   onSaveProgressNow,
@@ -1252,6 +1257,33 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
 
   const mockGradeResult = gradePrcAnswerSheet(keyItems, mockShadedMap);
 
+  // Mastery percentages per section and subsection, from your saved answers
+  const masteryStats = computeMasteryStats(attemptLogs || [], subject.id, subject.sections);
+  const masteryTone = (pct: number | null) =>
+    pct === null
+      ? 'text-slate-500 dark:text-[#9FB0C7]'
+      : pct >= COMPETENCY_MASTERY_THRESHOLD_PERCENT
+      ? 'text-[#1E7A5F] dark:text-[#68C7C5]'
+      : pct >= 50
+      ? 'text-[#8C4D11] dark:text-[#F2AE63]'
+      : 'text-rose-600 dark:text-rose-400';
+  const masteryBarTone = (pct: number | null) =>
+    pct === null
+      ? 'bg-slate-300 dark:bg-[#293D5C]'
+      : pct >= COMPETENCY_MASTERY_THRESHOLD_PERCENT
+      ? 'bg-[#2E7978]'
+      : pct >= 50
+      ? 'bg-[#D9822B]'
+      : 'bg-rose-500';
+  const masteryLabel = (pct: number | null) =>
+    pct === null
+      ? 'Not started'
+      : pct >= COMPETENCY_MASTERY_THRESHOLD_PERCENT
+      ? 'Mastered'
+      : pct >= 50
+      ? 'Developing'
+      : 'Needs work';
+
   // Evaluate Practice Quiz progress & automatic Section Goal mastery
   const quizEval = evaluateQuizCompletionAndSectionGoals(
     practiceDisplayedQuestions,
@@ -1773,7 +1805,13 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
             const masteredCount = section.competencies.filter(
               (c) => masteredCompetencies[c.id]
             ).length;
-            const isSectionCleared = totalComps > 0 && masteredCount === totalComps;
+            const secMastery = masteryStats.bySection[section.id] || {
+              attempts: 0,
+              correct: 0,
+              accuracyPercent: null,
+              practicedGoals: 0,
+              totalGoals: totalComps,
+            };
             const secBandTone =
               secIdx % 3 === 0
                 ? {
@@ -1810,16 +1848,45 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
                       <h2 className={`text-base sm:text-lg font-display font-semibold ${secBandTone.title}`}>
                         Section {section.sectionLetter}. {section.title}
                       </h2>
-                      {isSectionCleared && (
-                        <span className="inline-flex items-center gap-1 text-xs font-semibold text-[#143D3C] dark:text-[#68C7C5]">
-                          <CheckCircle2 className="w-3.5 h-3.5" />
-                          <span>Section Goals Cleared</span>
+                      <span
+                        className={`inline-flex items-center gap-1 text-xs font-semibold ${masteryTone(
+                          secMastery.accuracyPercent
+                        )}`}
+                      >
+                        {secMastery.accuracyPercent !== null &&
+                          secMastery.accuracyPercent >= COMPETENCY_MASTERY_THRESHOLD_PERCENT && (
+                            <CheckCircle2 className="w-3.5 h-3.5" />
+                          )}
+                        <span>
+                          {secMastery.accuracyPercent === null
+                            ? 'Mastery: not started'
+                            : `Mastery ${secMastery.accuracyPercent}% · ${masteryLabel(
+                                secMastery.accuracyPercent
+                              )}`}
                         </span>
-                      )}
+                      </span>
                     </div>
                     <p className={`text-xs font-mono mt-0.5 ${secBandTone.meta}`}>
-                      {section.weightPercent}% · {masteredCount}/{totalComps} goals cleared
+                      {section.weightPercent}% of exam ·{' '}
+                      {secMastery.attempts > 0
+                        ? `${secMastery.correct}/${secMastery.attempts} correct · `
+                        : ''}
+                      {secMastery.practicedGoals}/{totalComps} goals practiced · {masteredCount}/
+                      {totalComps} goals mastered
                     </p>
+                    <div
+                      className="mt-1.5 h-1.5 w-full max-w-xs rounded-full bg-slate-200/80 dark:bg-[#22324D] overflow-hidden"
+                      role="progressbar"
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                      aria-valuenow={secMastery.accuracyPercent ?? 0}
+                      aria-label={`Section ${section.sectionLetter} mastery`}
+                    >
+                      <div
+                        className={`h-full rounded-full ${masteryBarTone(secMastery.accuracyPercent)}`}
+                        style={{ width: `${secMastery.accuracyPercent ?? 0}%` }}
+                      />
+                    </div>
                   </div>
 
                   <div className="flex items-center gap-2 w-full sm:w-auto shrink-0">
@@ -1855,6 +1922,11 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
                 <div className="divide-y divide-slate-100 dark:divide-[#22324D]">
                   {section.competencies.map((comp: TosCompetency) => {
                     const isMastered = Boolean(masteredCompetencies[comp.id]);
+                    const compMastery = masteryStats.byCompetency[comp.id] || {
+                      attempts: 0,
+                      correct: 0,
+                      accuracyPercent: null,
+                    };
 
                     return (
                       <button
@@ -1883,8 +1955,15 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
                           </span>
                         </div>
 
-                        <span className="text-xs font-mono text-slate-500 dark:text-[#9FB0C7] whitespace-nowrap shrink-0">
-                          {comp.itemCount} {comp.itemCount === 1 ? 'item' : 'items'}
+                        <span className="flex flex-col items-end gap-0.5 text-xs font-mono whitespace-nowrap shrink-0">
+                          <span className="text-slate-500 dark:text-[#9FB0C7]">
+                            {comp.itemCount} {comp.itemCount === 1 ? 'item' : 'items'}
+                          </span>
+                          <span className={masteryTone(compMastery.accuracyPercent)}>
+                            {compMastery.accuracyPercent === null
+                              ? 'No data yet'
+                              : `${compMastery.accuracyPercent}% · ${compMastery.correct}/${compMastery.attempts}`}
+                          </span>
                         </span>
                       </button>
                     );
@@ -2551,14 +2630,14 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
                           {quizEval.clearedSections
                             .map((s) => `${s.sectionLetter} (${s.competencyIds.length} goals)`)
                             .join(', ')}{' '}
-                          automatically cleared in Syllabus.
+                          reached {COMPETENCY_MASTERY_THRESHOLD_PERCENT}%+ mastery — see percentages in Syllabus.
                         </span>
                       </p>
                     ) : quizEval.targetSection && !quizEval.isAllAnswered ? (
                       <p className="text-xs text-slate-500 dark:text-[#9FB0C7]">
                         Finish all {quizEval.totalItems} items in this Section{' '}
-                        {quizEval.targetSection.sectionLetter} quiz to automatically clear its{' '}
-                        {quizEval.targetSection.competencyIds.length} Section Goals in Syllabus.
+                        {quizEval.targetSection.sectionLetter} quiz. A goal is cleared only with{' '}
+                        {COMPETENCY_MASTERY_MIN_ITEMS}+ items at {COMPETENCY_MASTERY_THRESHOLD_PERCENT}%+ accuracy.
                       </p>
                     ) : (
                       <p className="text-xs text-slate-500 dark:text-[#9FB0C7]">
