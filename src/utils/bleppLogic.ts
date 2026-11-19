@@ -1297,16 +1297,28 @@ export interface QuizCompletionEvaluation {
   clearedCompetencyIds: string[];
 }
 
+/** Minimum accuracy (and sample size) for a competency to count as "mastered" from quiz evidence. */
+export const COMPETENCY_MASTERY_THRESHOLD_PERCENT = 75;
+export const COMPETENCY_MASTERY_MIN_ITEMS = 2;
+
+/** Pulls "1.1"-style competency numbers out of codes like "1.1", "A 1.1" or "Section A 1.1". */
+export function extractCompetencyCode(raw?: string | null): string | null {
+  if (!raw) return null;
+  const m = String(raw).match(/(\d+)\s*\.\s*(\d+)/);
+  return m ? `${Number(m[1])}.${Number(m[2])}` : null;
+}
+
 /**
- * Evaluates current Practice Quiz progress and determines which PRC TOS Section Goals
- * (competencies) are automatically cleared upon completing a Section Quiz (or passing
- * sections at >=75% on an All-Sections quiz).
+ * Evaluates current Practice Quiz progress. A TOS competency (goal) is auto-cleared only when this quiz gives
+ * real evidence: at least COMPETENCY_MASTERY_MIN_ITEMS answered items on it with >= 75% accuracy. Finishing a
+ * quiz no longer clears goals by itself; see computeMasteryStats() for the percentages shown in the Syllabus.
  */
 export function evaluateQuizCompletionAndSectionGoals(
   displayedQuestions: {
     id: string;
     sectionCode: string;
     correctChoice: 'A' | 'B' | 'C' | 'D';
+    tosCode?: string;
   }[],
   submittedAnswers: Record<string, 'A' | 'B' | 'C' | 'D'>,
   selectedScope: string,
@@ -1314,7 +1326,7 @@ export function evaluateQuizCompletionAndSectionGoals(
     id: string;
     sectionLetter: string;
     title: string;
-    competencies: { id: string }[];
+    competencies: { id: string; code?: string }[];
   }[]
 ): QuizCompletionEvaluation {
   const totalItems = displayedQuestions.length;
@@ -1350,38 +1362,43 @@ export function evaluateQuizCompletionAndSectionGoals(
     : null;
 
   const clearedSections: QuizCompletionEvaluation['clearedSections'] = [];
+  const clearedCompetencyIdSet = new Set<string>();
 
   if (isAllAnswered) {
-    if (targetSection) {
-      // User generated and finished a dedicated Section Quiz -> clear that section's goals
-      clearedSections.push(targetSection);
-    } else {
-      // Full-subject quiz -> clear any represented section where all items were answered at >=75%
-      for (const sec of sections) {
-        const secLetter = sec.sectionLetter.trim().toUpperCase();
-        const secQs = displayedQuestions.filter(
-          (q) => normalizeSectionLetter(q.sectionCode, '') === secLetter
-        );
-        if (secQs.length === 0) continue;
-        const secCorrect = secQs.filter(
+    for (const sec of sections) {
+      const secLetter = sec.sectionLetter.trim().toUpperCase();
+      const secQs = displayedQuestions.filter(
+        (q) => normalizeSectionLetter(q.sectionCode, '') === secLetter
+      );
+      if (secQs.length === 0) continue;
+
+      const clearedHere: string[] = [];
+      for (const comp of sec.competencies) {
+        const compCode = extractCompetencyCode(comp.code);
+        if (!compCode) continue;
+        const compQs = secQs.filter((q) => extractCompetencyCode(q.tosCode) === compCode);
+        if (compQs.length < COMPETENCY_MASTERY_MIN_ITEMS) continue;
+        const compCorrect = compQs.filter(
           (q) => submittedAnswers[q.id] === q.correctChoice
         ).length;
-        const secAcc = (secCorrect / secQs.length) * 100;
-        if (secAcc >= 75) {
-          clearedSections.push({
-            id: sec.id,
-            sectionLetter: sec.sectionLetter,
-            title: sec.title,
-            competencyIds: sec.competencies.map((c) => c.id),
-          });
+        if ((compCorrect / compQs.length) * 100 >= COMPETENCY_MASTERY_THRESHOLD_PERCENT) {
+          clearedHere.push(comp.id);
+          clearedCompetencyIdSet.add(comp.id);
         }
+      }
+
+      if (clearedHere.length > 0) {
+        clearedSections.push({
+          id: sec.id,
+          sectionLetter: sec.sectionLetter,
+          title: sec.title,
+          competencyIds: clearedHere,
+        });
       }
     }
   }
 
-  const clearedCompetencyIds = Array.from(
-    new Set(clearedSections.flatMap((s) => s.competencyIds))
-  );
+  const clearedCompetencyIds = Array.from(clearedCompetencyIdSet);
 
   return {
     totalItems,
@@ -1393,6 +1410,73 @@ export function evaluateQuizCompletionAndSectionGoals(
     clearedSections,
     clearedCompetencyIds,
   };
+}
+
+export interface MasteryStat {
+  attempts: number;
+  correct: number;
+  /** null when there is no data yet */
+  accuracyPercent: number | null;
+}
+
+export interface SectionMasteryStat extends MasteryStat {
+  practicedGoals: number;
+  totalGoals: number;
+}
+
+/**
+ * Mastery percentages per section and per subsection (competency), from the latest answer to each question.
+ * Items the AI could not tie to a specific competency still count toward their section total.
+ */
+export function computeMasteryStats(
+  attemptLogs: QuestionAttemptLog[],
+  subjectId: SubjectId,
+  sections: {
+    id: string;
+    sectionLetter: string;
+    competencies: { id: string; code?: string }[];
+  }[]
+): {
+  bySection: Record<string, SectionMasteryStat>;
+  byCompetency: Record<string, MasteryStat>;
+} {
+  const latestByQuestion = new Map<string, QuestionAttemptLog>();
+  for (const log of attemptLogs) {
+    if (log.subjectId !== subjectId) continue;
+    const prev = latestByQuestion.get(log.questionId);
+    if (!prev || log.timestamp >= prev.timestamp) latestByQuestion.set(log.questionId, log);
+  }
+  const logs = Array.from(latestByQuestion.values());
+
+  const toStat = (attempts: number, correct: number): MasteryStat => ({
+    attempts,
+    correct,
+    accuracyPercent: attempts > 0 ? Math.round((correct / attempts) * 100) : null,
+  });
+
+  const bySection: Record<string, SectionMasteryStat> = {};
+  const byCompetency: Record<string, MasteryStat> = {};
+
+  for (const sec of sections) {
+    const secLetter = sec.sectionLetter.trim().toUpperCase();
+    const secLogs = logs.filter((l) => normalizeSectionLetter(l.sectionCode, '') === secLetter);
+    let practicedGoals = 0;
+
+    for (const comp of sec.competencies) {
+      const compCode = extractCompetencyCode(comp.code);
+      const compLogs = compCode
+        ? secLogs.filter((l) => extractCompetencyCode(l.tosCode) === compCode)
+        : [];
+      const stat = toStat(compLogs.length, compLogs.filter((l) => l.isCorrect).length);
+      byCompetency[comp.id] = stat;
+      if (stat.attempts > 0) practicedGoals++;
+    }
+
+    const base = toStat(secLogs.length, secLogs.filter((l) => l.isCorrect).length);
+    bySection[sec.id] = { ...base, practicedGoals, totalGoals: sec.competencies.length };
+  }
+
+  return { bySection, byCompetency };
 }
 
 export interface ResumableSessionInfo {
