@@ -1048,7 +1048,18 @@ function dropNearIdenticalOptionSets(items: Array<Record<string, unknown>>): Arr
   return kept;
 }
 
-/** Randomizes option order (and remaps the key and rationales) so the keyed answer isn't always in the same slot. */
+/** Rewrites "option C" / "choices A and B" / "[D]" style references after the options were reordered. */
+function remapOptionLetterRefs(text: string, letterMap: Record<string, string>): string {
+  return text
+    .replace(
+      /\b((?:[Oo]ption|[Cc]hoice|[Aa]nswer)s?)(\s+)([A-D](?:\s*(?:,|and|or|&|\/)\s*[A-D])*)\b/g,
+      (_m, word: string, space: string, letters: string) =>
+        word + space + letters.replace(/[A-D]/g, (l: string) => letterMap[l] || l)
+    )
+    .replace(/\[([A-D])\]/g, (_m, l: string) => `[${letterMap[l] || l}]`);
+}
+
+/** Randomizes option order (and remaps the key, rationales and letter references) so the keyed answer isn't always in the same slot. */
 function shuffleQuestionOptions(item: Record<string, unknown>): Record<string, unknown> {
   const options = item.options as Record<string, string> | undefined;
   const key = String(item.correctChoice);
@@ -1056,9 +1067,9 @@ function shuffleQuestionOptions(item: Record<string, unknown>): Record<string, u
 
   const texts = OPTION_LETTERS.map((l) => String(options[l] ?? ''));
   const rationales = (item.optionRationales || {}) as Record<string, string>;
-  const joined = [...texts, ...OPTION_LETTERS.map((l) => String(rationales[l] ?? ''))].join(' ');
-  // Keep the original order when options depend on each other ("all of the above", "both A and B", "Option C", ...)
-  if (/(all|none) of the (above|these)|\b(both|either)\s+[A-D]\b|\b(options?|choices?)\s+[A-D]\b/i.test(joined)) {
+  // Keep the original order when the stem or options depend on each other ("all of the above", "both A and B", ...)
+  const dependencyText = [String(item.stem ?? ''), ...texts].join(' ');
+  if (/(all|none) of the (above|these)|\b(both|either)\s+[A-D]\b|\b(options?|choices?)\s+[A-D]\b/i.test(dependencyText)) {
     return item;
   }
 
@@ -1068,22 +1079,28 @@ function shuffleQuestionOptions(item: Record<string, unknown>): Record<string, u
     [order[i], order[j]] = [order[j], order[i]];
   }
 
+  const letterMap: Record<string, string> = {};
+  order.forEach((oldIdx, newIdx) => {
+    letterMap[OPTION_LETTERS[oldIdx]] = OPTION_LETTERS[newIdx];
+  });
+  const remap = (value: unknown): string => remapOptionLetterRefs(String(value ?? ''), letterMap);
+
   const newOptions: Record<string, string> = {};
   const newRationales: Record<string, string> = {};
-  let newKey = key;
   order.forEach((oldIdx, newIdx) => {
     const newLetter = OPTION_LETTERS[newIdx];
     const oldLetter = OPTION_LETTERS[oldIdx];
     newOptions[newLetter] = texts[oldIdx];
-    if (rationales[oldLetter] !== undefined) newRationales[newLetter] = rationales[oldLetter];
-    if (oldLetter === key) newKey = newLetter;
+    if (rationales[oldLetter] !== undefined) newRationales[newLetter] = remap(rationales[oldLetter]);
   });
 
   return {
     ...item,
     options: newOptions,
-    correctChoice: newKey,
+    correctChoice: letterMap[key],
     ...(item.optionRationales ? { optionRationales: newRationales } : {}),
+    ...(typeof item.examTip === 'string' ? { examTip: remap(item.examTip) } : {}),
+    ...(typeof item.rationale === 'string' ? { rationale: remap(item.rationale) } : {}),
   };
 }
 
@@ -1203,7 +1220,9 @@ Every item MUST present a 100% fresh angle, scenario, and mutually distinct conc
 - Re-read the stem and list every detail that rules options in or out. Example: if twins are "raised apart" in different environments, an explanation that depends on a shared rearing home (such as passive gene–environment correlation) cannot be the answer.
 - Exactly ONE option may be defensible according to standard Philippine psychometrician review sources and mainstream textbooks. If two options could both be argued, rewrite the stem or the distractor.
 - Write the rationales first, then set correctChoice to the option your rationales and examTip name as best. The rationale for the keyed option must say why it is right, and every other rationale must say why it is wrong for THIS stem.
-- Do not key an option that needs an assumption the stem does not state.`;
+- Do not key an option that needs an assumption the stem does not state.
+- optionRationales and examTip may only cite facts that appear in the stem. NEVER invent details the stem does not give (for example absences, grades, scores, symptoms, or history).
+- NEVER refer to options by letter ("option A", "[B]") inside optionRationales or examTip; describe the option's content instead.`;
 
     const lengthDirective = compactMode
       ? 'Keep each optionRationale to 1 crisp sentence and examTip to 1 crisp sentence.'
