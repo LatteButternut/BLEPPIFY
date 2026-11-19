@@ -719,8 +719,12 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
   // 2. Generate Configurable (5–50 Item, Default 15) Practice / Section Quiz (Parallel Sub-Batches + Strict Section Isolation)
   const handleGeneratePracticeQuiz = async (
     customScopeKey?: string,
-    customItemCount?: number
+    customItemCount?: number,
+    options: { appendToCurrent?: boolean } = {}
   ) => {
+    // appendToCurrent: keep the questions (and answers) already in the quiz and only generate the missing ones
+    const appendMode = Boolean(options.appendToCurrent);
+    const existingQuizItems: BoardQuestionItem[] = appendMode ? [...practiceDisplayedQuestions] : [];
     const targetScope = customScopeKey || practiceScope || 'ALL';
     const targetQuizSize = normalizeQuizItemCount(
       customItemCount ?? getQuizSizeForScope(targetScope),
@@ -738,7 +742,7 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
     setIsGenerating(true);
     setIsGeneratingQuiz(true);
     setQuizGeneratingTarget(targetQuizSize);
-    setQuizStreamCount(0);
+    setQuizStreamCount(appendMode ? existingQuizItems.length : 0);
     setGenError(null);
     setSaveFeedback('idle');
     setStudyMode('practice');
@@ -763,7 +767,9 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
     }));
 
     setGenBanner(
-      `Generating ${targetQuizSize}-item ${
+      appendMode
+        ? `Generating the remaining ${Math.max(0, targetQuizSize - existingQuizItems.length)} quiz items — your current questions and answers are kept...`
+        : `Generating ${targetQuizSize}-item ${
         lockedSectionLetter
           ? `Section ${lockedSectionLetter} (${lockedSectionTitle}) `
           : ''
@@ -780,23 +786,25 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
       );
 
       const pdfRefs = await preparePdfRefsForApi();
-      const subBatches = buildPracticeQuizParallelBatches(
-        details,
-        difficultyFilter,
-        targetQuizSize,
-        lockedSectionLetter
-          ? {
-              subjectId: subject.id,
-              sectionLetter: lockedSectionLetter,
-              sectionTitle: lockedSectionTitle || title,
-            }
-          : undefined
-      );
+      const subBatches = appendMode
+        ? []
+        : buildPracticeQuizParallelBatches(
+            details,
+            difficultyFilter,
+            targetQuizSize,
+            lockedSectionLetter
+              ? {
+                  subjectId: subject.id,
+                  sectionLetter: lockedSectionLetter,
+                  sectionTitle: lockedSectionTitle || title,
+                }
+              : undefined
+          );
 
-      const acceptedItems: BoardQuestionItem[] = [];
+      const acceptedItems: BoardQuestionItem[] = appendMode ? [...existingQuizItems] : [];
       const fallbackPureMapped: BoardQuestionItem[] = [];
       const runningExcludedStems = [...priorStems];
-      let hasCommittedFirstWave = false;
+      let hasCommittedFirstWave = appendMode;
       const batchErrors: string[] = [];
 
       const commitProgressiveWave = (waveItems: BoardQuestionItem[]) => {
@@ -949,13 +957,13 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
       // Fast bounded top-up waves (<= 10 items per call) if strict section purity or deduplication left fewer than targetQuizSize
       for (
         let topUpAttempt = 0;
-        topUpAttempt < 2 &&
+        topUpAttempt < (appendMode ? 4 : 2) &&
         acceptedItems.length < targetQuizSize &&
         quizRunNonceRef.current === currentRunNonce;
         topUpAttempt++
       ) {
         const needed = targetQuizSize - acceptedItems.length;
-        const topUpCount = Math.min(10, needed + 2);
+        const topUpCount = Math.min(appendMode ? 8 : 10, needed + 2);
         const topUpRes = await postGeminiJsonWithPdfRetry(
           '/api/gemini/questions',
           {
@@ -1011,6 +1019,23 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
         throw new Error(
           batchErrors[0] || 'No questions were returned. Please try again.'
         );
+      }
+
+      if (appendMode) {
+        const addedCount = finalQuizItems.length - existingQuizItems.length;
+        if (addedCount <= 0) {
+          throw new Error(
+            batchErrors[0] ||
+              'Could not generate the remaining items right now (the AI service may be busy or rate limited). Please try again in a minute.'
+          );
+        }
+        onRecordSeenStems(finalQuizItems.slice(existingQuizItems.length).map((q) => q.stem));
+        setGenBanner(
+          finalQuizItems.length < targetQuizSize
+            ? `Added ${addedCount} item(s). The quiz has ${finalQuizItems.length} of ${targetQuizSize} — you can generate the rest again.`
+            : `Added ${addedCount} item(s). Your quiz is complete (${finalQuizItems.length} of ${targetQuizSize}).`
+        );
+        return;
       }
 
       if (!hasCommittedFirstWave) {
@@ -2205,6 +2230,28 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
                 </div>
 
                 <div className="flex flex-wrap items-center gap-3">
+                  {!isGeneratingQuiz &&
+                    practiceDisplayedQuestions.length > 0 &&
+                    practiceDisplayedQuestions.length < activeQuizSize && (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            void handleGeneratePracticeQuiz(practiceScope, activeQuizSize, {
+                              appendToCurrent: true,
+                            })
+                          }
+                          className="min-h-[36px] sm:min-h-0 inline-flex items-center gap-1 px-3 py-1.5 sm:py-1 rounded-md border border-[#2E7978] text-[#2E7978] dark:text-[#68C7C5] dark:border-[#68C7C5] hover:bg-[#2E7978]/10 font-semibold transition-colors"
+                        >
+                          <span>
+                            Generate {activeQuizSize - practiceDisplayedQuestions.length} more
+                          </span>
+                        </button>
+                        <span aria-hidden="true" className="text-slate-300 dark:text-slate-600">
+                          ·
+                        </span>
+                      </>
+                    )}
                   <button
                     type="button"
                     onClick={() =>
