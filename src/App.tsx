@@ -1082,6 +1082,7 @@ export default function App() {
             resumeNonce={resumeScroll.nonce}
             masteredCompetencies={cloudState.masteredCompetencies}
             onToggleCompetency={handleToggleCompetency}
+            attemptLogs={cloudState.attemptLogs}
             onMarkCompetenciesMastered={handleMarkCompetenciesMastered}
             onUnmarkCompetencies={handleUnmarkCompetencies}
             onRemoveAttemptsForQuestions={handleRemoveAttemptsForQuestions}
