@@ -1001,6 +1001,58 @@ function optionTokenSet(options: Record<string, unknown> | undefined): Set<strin
   return new Set(text.match(/[a-z]{4,}/g) || []);
 }
 
+const GIVEAWAY_SKIP_WORDS = new Set([
+  'that', 'this', 'with', 'from', 'which', 'what', 'when', 'where', 'their', 'there', 'these', 'those',
+  'best', 'most', 'following', 'would', 'could', 'should', 'because', 'about', 'into', 'than', 'have',
+]);
+
+function contentBigrams(text: string): Set<string> {
+  const words = text
+    .toLowerCase()
+    .replace(/-/g, '')
+    .replace(/[^a-z\s]/g, ' ')
+    .split(/\s+/)
+    .filter(Boolean);
+  const grams = new Set<string>();
+  for (let i = 0; i < words.length - 1; i++) {
+    const a = words[i];
+    const b = words[i + 1];
+    if (a.length < 4 || b.length < 4) continue;
+    if (GIVEAWAY_SKIP_WORDS.has(a) || GIVEAWAY_SKIP_WORDS.has(b)) continue;
+    grams.add(`${a} ${b}`);
+  }
+  return grams;
+}
+
+/**
+ * True when the keyed option repeats a two-word phrase from the stem (e.g. the theory's name) that none of
+ * the distractors do, so the item can be answered by keyword matching.
+ */
+function isNameMatchGiveaway(item: Record<string, unknown>): boolean {
+  const options = item.options as Record<string, string> | undefined;
+  const key = String(item.correctChoice);
+  if (!options || !OPTION_LETTERS.includes(key as (typeof OPTION_LETTERS)[number])) return false;
+  const stemGrams = contentBigrams(String(item.stem ?? ''));
+  if (stemGrams.size === 0) return false;
+  const shared = (text: string): number => {
+    let n = 0;
+    for (const g of contentBigrams(text)) if (stemGrams.has(g)) n++;
+    return n;
+  };
+  const keyed = shared(String(options[key] ?? ''));
+  if (keyed === 0) return false;
+  return OPTION_LETTERS.filter((l) => l !== key).every((l) => shared(String(options[l] ?? '')) === 0);
+}
+
+/** Keeps the Bloom's label honest: a keyword-match item labeled Analyzing/Evaluating/Creating becomes Understanding. */
+function relabelGiveawayItem(item: Record<string, unknown>): Record<string, unknown> {
+  const level = String(item.bloomsLevel ?? '').trim().toLowerCase();
+  if (['analyzing', 'evaluating', 'creating'].includes(level) && isNameMatchGiveaway(item)) {
+    return { ...item, bloomsLevel: 'Understanding' };
+  }
+  return item;
+}
+
 /** Drops items whose four options are almost the same words as an earlier item in the same batch. */
 function dropNearIdenticalOptionSets(items: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
   const kept: Array<Record<string, unknown>> = [];
@@ -1207,6 +1259,10 @@ Every item MUST present a 100% fresh angle, scenario, and mutually distinct conc
 - Analyzing: require breaking a case or concept into parts, comparing or differentiating look-alike concepts, or identifying which cue/evidence supports which conclusion. Options are differences, relationships or evidence, not just labels. Difficult.
 - Evaluating: require judging, justifying or critiquing a decision, interpretation, finding or approach against criteria (for example "which conclusion is best supported", "which approach is most defensible", "what is the flaw"). Difficult.
 - Creating: require proposing, formulating or designing a plan, hypothesis, response or tool. Difficult.
+- DIFFICULTY CHECK: for Applying, Analyzing, Evaluating and Creating items, the stem must NOT name the theory, concept or term that the correct option states. Never write a stem like "...why this is misaligned with Contingency Theory?" with an option beginning "Contingency Theory asserts...". Describe the situation and make the student identify the principle themselves.
+- Distractors must not simply be the names or definitions of other theories. At least two distractors must be statements that are true in general but wrong or only partly right for THIS case, so a student who only memorized definitions could miss the item.
+- All four options must have similar length, form and grammar. The correct option must not be the only one that echoes wording from the stem.
+- Keyword-match test: if the answer can be found by matching a word or name in the stem, rewrite the item or label it Understanding.
 - Items at different levels must LOOK different: vary stem length, format and the question verb. Do NOT write every item as the same "a person shows X; which factor indicates Y?" vignette.
 - Follow the competency verbs in the TOS text above (Recognize/Identify = Remembering, Explain/Describe/Illustrate = Understanding, Apply/Employ = Applying, Analyze/Differentiate/Compare = Analyzing, Evaluate/Assess/Appraise = Evaluating, Formulate/Develop = Creating) and any level named in the sub-batch assignment.${conceptExclusionBlock}`;
 
@@ -1344,7 +1400,9 @@ IMPORTANT: NEVER mention "Section A/B/C/D/E/F" or TOS code numbers inside stem, 
     const rawText = (response.text ?? '[]').trim();
     const parsedQuestions = JSON.parse(rawText);
     const variedQuestions = Array.isArray(parsedQuestions)
-      ? dropNearIdenticalOptionSets(parsedQuestions as Array<Record<string, unknown>>).map(shuffleQuestionOptions)
+      ? dropNearIdenticalOptionSets(parsedQuestions as Array<Record<string, unknown>>)
+          .map(relabelGiveawayItem)
+          .map(shuffleQuestionOptions)
       : [];
     const questions = Array.isArray(variedQuestions)
       ? variedQuestions.map((item: Record<string, unknown>) => {
