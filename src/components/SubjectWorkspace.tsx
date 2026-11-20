@@ -46,6 +46,7 @@ import {
   computeMasteryStats,
   COMPETENCY_MASTERY_THRESHOLD_PERCENT,
   COMPETENCY_MASTERY_MIN_ITEMS,
+  COMPETENCY_MIN_ANSWERS_FOR_TIER,
   ExamAnswerKeyItem,
   filterPureLockedSectionQuestions,
   filterQuestionsStrictByScope,
@@ -1292,7 +1293,8 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
     practiceDisplayedQuestions,
     submittedPracticeAnswers,
     practiceScope,
-    subject.sections
+    subject.sections,
+    masteryStats.byCompetency
   );
 
   // Automatically clear Section Goals only when all items are answered AND progressive generation is complete
@@ -1827,6 +1829,8 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
               attempts: 0,
               correct: 0,
               accuracyPercent: null,
+              masteryPercent: null,
+              hasEnoughData: false,
               practicedGoals: 0,
               totalGoals: totalComps,
             };
@@ -1868,18 +1872,18 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
                       </h2>
                       <span
                         className={`inline-flex items-center gap-1 text-xs font-semibold ${masteryTone(
-                          secMastery.accuracyPercent
+                          secMastery.masteryPercent
                         )}`}
                       >
-                        {secMastery.accuracyPercent !== null &&
-                          secMastery.accuracyPercent >= COMPETENCY_MASTERY_THRESHOLD_PERCENT && (
+                        {secMastery.masteryPercent !== null &&
+                          secMastery.masteryPercent >= COMPETENCY_MASTERY_THRESHOLD_PERCENT && (
                             <CheckCircle2 className="w-3.5 h-3.5" />
                           )}
                         <span>
-                          {secMastery.accuracyPercent === null
+                          {secMastery.masteryPercent === null
                             ? 'Mastery: not started'
-                            : `Mastery ${secMastery.accuracyPercent}% · ${masteryLabel(
-                                secMastery.accuracyPercent
+                            : `Mastery ${secMastery.masteryPercent}% · ${masteryLabel(
+                                secMastery.masteryPercent
                               )}`}
                         </span>
                       </span>
@@ -1887,7 +1891,7 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
                     <p className={`text-xs font-mono mt-0.5 ${secBandTone.meta}`}>
                       {section.weightPercent}% of exam ·{' '}
                       {secMastery.attempts > 0
-                        ? `${secMastery.correct}/${secMastery.attempts} correct · `
+                        ? `${secMastery.correct}/${secMastery.attempts} correct (${secMastery.accuracyPercent}% raw) · `
                         : ''}
                       {secMastery.practicedGoals}/{totalComps} goals practiced · {masteredCount}/
                       {totalComps} goals mastered
@@ -1897,12 +1901,12 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
                       role="progressbar"
                       aria-valuemin={0}
                       aria-valuemax={100}
-                      aria-valuenow={secMastery.accuracyPercent ?? 0}
+                      aria-valuenow={secMastery.masteryPercent ?? 0}
                       aria-label={`Section ${section.sectionLetter} mastery`}
                     >
                       <div
-                        className={`h-full rounded-full ${masteryBarTone(secMastery.accuracyPercent)}`}
-                        style={{ width: `${secMastery.accuracyPercent ?? 0}%` }}
+                        className={`h-full rounded-full ${masteryBarTone(secMastery.masteryPercent)}`}
+                        style={{ width: `${secMastery.masteryPercent ?? 0}%` }}
                       />
                     </div>
                   </div>
@@ -1944,6 +1948,8 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
                       attempts: 0,
                       correct: 0,
                       accuracyPercent: null,
+                      masteryPercent: null,
+                      hasEnoughData: false,
                     };
 
                     return (
@@ -1977,10 +1983,18 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
                           <span className="text-slate-500 dark:text-[#9FB0C7]">
                             {comp.itemCount} {comp.itemCount === 1 ? 'item' : 'items'}
                           </span>
-                          <span className={masteryTone(compMastery.accuracyPercent)}>
-                            {compMastery.accuracyPercent === null
+                          <span
+                            className={
+                              compMastery.hasEnoughData
+                                ? masteryTone(compMastery.masteryPercent)
+                                : 'text-slate-500 dark:text-[#9FB0C7]'
+                            }
+                          >
+                            {compMastery.attempts === 0
                               ? 'No data yet'
-                              : `${compMastery.accuracyPercent}% · ${compMastery.correct}/${compMastery.attempts}`}
+                              : compMastery.hasEnoughData
+                              ? `Mastery ${compMastery.masteryPercent}% · ${compMastery.correct}/${compMastery.attempts} correct`
+                              : `${compMastery.correct}/${compMastery.attempts} correct · too few answers`}
                           </span>
                         </span>
                       </button>
@@ -2657,7 +2671,7 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
                       <p className="text-xs text-slate-500 dark:text-[#9FB0C7]">
                         Finish all {quizEval.totalItems} items in this Section{' '}
                         {quizEval.targetSection.sectionLetter} quiz. A goal is cleared only with{' '}
-                        {COMPETENCY_MASTERY_MIN_ITEMS}+ items at {COMPETENCY_MASTERY_THRESHOLD_PERCENT}%+ accuracy.
+                        {COMPETENCY_MASTERY_MIN_ITEMS}+ answers on it and {COMPETENCY_MASTERY_THRESHOLD_PERCENT}%+ mastery.
                       </p>
                     ) : (
                       <p className="text-xs text-slate-500 dark:text-[#9FB0C7]">
