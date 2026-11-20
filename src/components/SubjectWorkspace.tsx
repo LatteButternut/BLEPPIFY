@@ -220,6 +220,7 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
   const [genBanner, setGenBanner] = useState<string | null>(null);
   const [genError, setGenError] = useState<string | null>(null);
   const [saveFeedback, setSaveFeedback] = useState<'idle' | 'saving' | 'saved'>('idle');
+  const [saveNotice, setSaveNotice] = useState<string | null>(null);
   const syncedPdfIdsRef = useRef<Set<string>>(new Set());
   const quizRunNonceRef = useRef<number>(0);
 
@@ -296,6 +297,7 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
     setGenBanner(null);
     setGenError(null);
     setSaveFeedback('idle');
+    setSaveNotice(null);
   }, [subject.id]);
 
   // Keep local countdown display synced when switching subjects or resetting session
@@ -750,6 +752,7 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
     setQuizStreamCount(appendMode ? existingQuizItems.length : 0);
     setGenError(null);
     setSaveFeedback('idle');
+    setSaveNotice(null);
     setStudyMode('practice');
 
     onUpdateSessionProgress((prev) => ({
@@ -1315,6 +1318,7 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
 
   const handleExplicitSaveQuizProgress = async (markCompleted: boolean) => {
     setSaveFeedback('saving');
+    setSaveNotice(null);
     if (quizEval.clearedCompetencyIds.length > 0) {
       onMarkCompetenciesMastered(quizEval.clearedCompetencyIds);
     }
@@ -1330,8 +1334,20 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
     }
     // Wait one tick so latest state ref captures session update before flushing to cloud
     await new Promise((r) => window.setTimeout(r, 20));
-    await onSaveProgressNow();
+    // Never leave the button stuck on "Saving…": the copy on this device is written first, and the cloud
+    // upload keeps running in the background if it is slow.
+    const outcome = await Promise.race<'ok' | 'failed' | 'slow'>([
+      onSaveProgressNow()
+        .then((ok) => (ok ? 'ok' : 'failed') as 'ok' | 'failed')
+        .catch(() => 'failed' as const),
+      new Promise<'slow'>((resolve) => window.setTimeout(() => resolve('slow'), 8000)),
+    ]);
     setSaveFeedback('saved');
+    if (outcome === 'slow') {
+      setSaveNotice('Saved on this device. The cloud upload is taking a while and will finish in the background.');
+    } else if (outcome === 'failed') {
+      setSaveNotice('Saved on this device, but the cloud upload failed. It will retry automatically on your next change.');
+    }
   };
 
   const handleSelectDraftPracticeChoice = (
@@ -1340,6 +1356,7 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
   ) => {
     if (submittedPracticeAnswers[questionId]) return;
     setSaveFeedback('idle');
+    setSaveNotice(null);
     onUpdateSessionProgress((prev) => ({
       ...prev,
       practice: {
@@ -1359,6 +1376,7 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
     const chosen = draftPracticeChoices[q.id];
     if (!chosen) return;
     setSaveFeedback('idle');
+    setSaveNotice(null);
 
     onUpdateSessionProgress((prev) => ({
       ...prev,
@@ -2350,6 +2368,7 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
                     type="button"
                     onClick={() => {
                       setSaveFeedback('idle');
+    setSaveNotice(null);
                       onUpdateSessionProgress((prev) => ({
                         ...prev,
                         practice: {
@@ -2372,6 +2391,7 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
                     type="button"
                     onClick={() => {
                       setSaveFeedback('idle');
+    setSaveNotice(null);
                       const quizIds = new Set(
                         practiceDisplayedQuestions.map((q) => q.id)
                       );
@@ -2643,6 +2663,9 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
                       <p className="text-xs text-slate-500 dark:text-[#9FB0C7]">
                         Your submitted answers and analytics logs are synced—save below to finalize your session.
                       </p>
+                    )}
+                    {saveNotice && (
+                      <p className="text-xs text-amber-700 dark:text-[#F2AE63] mt-1">{saveNotice}</p>
                     )}
                   </div>
 
