@@ -259,29 +259,84 @@ export async function loadCloudAppState(userId?: string | null): Promise<CloudAp
   return await readFromIdb(resolvedUserId);
 }
 
-export async function saveCloudAppState(
+// ---------------------------------------------------------------------------
+// Saving: one upload at a time, newest state wins.
+// Before, every change started its own full upload, so several multi-MB uploads could run at once, slow
+// each other down, and an older upload could finish last and overwrite newer data.
+// ---------------------------------------------------------------------------
+let saveInFlight = false;
+let pendingSave: { state: CloudAppState; userId?: string | null } | null = null;
+let pendingWaiters: Array<(ok: boolean) => void> = [];
+const lastUploadedSignature = new Map<string, string>();
+
+async function performSave(state: CloudAppState, userId?: string | null): Promise<boolean> {
+  purgeLegacyProgressOnce();
+  const startedAt = Date.now();
+  const resolvedUserId = await resolveActiveSupabaseUserId(userId);
+
+  // Local copy first: this is what makes the progress safe on this device immediately
+  await writeToIdb(state, resolvedUserId);
+
+  if (!(isSupabaseConfigured && isUuid(resolvedUserId))) {
+    return true;
+  }
+
+  try {
+    // Skip the network entirely when nothing but the timestamp changed since the last successful upload
+    const signature = JSON.stringify({ ...state, updatedAt: 0 });
+    if (lastUploadedSignature.get(resolvedUserId) === signature) {
+      return true;
+    }
+
+    let ok = await upsertSupabaseUserData(resolvedUserId, state);
+    if (!ok) {
+      ok = await upsertSupabaseUserData(resolvedUserId, stripHeavyPdfBase64(state));
+    }
+    if (ok) {
+      lastUploadedSignature.set(resolvedUserId, signature);
+    }
+    console.info(
+      `[BLEPPIFY] cloud save ${ok ? 'ok' : 'FAILED'} in ${Date.now() - startedAt} ms (~${Math.round(
+        signature.length / 1024
+      )} KB)`
+    );
+    return ok;
+  } catch (err) {
+    console.error('[BLEPPIFY] saveCloudAppState threw:', err);
+    return false;
+  }
+}
+
+function startNextSave(): void {
+  const job = pendingSave;
+  const waiters = pendingWaiters;
+  pendingSave = null;
+  pendingWaiters = [];
+  if (!job) return;
+
+  saveInFlight = true;
+  performSave(job.state, job.userId)
+    .then((ok) => waiters.forEach((resolve) => resolve(ok)))
+    .catch(() => waiters.forEach((resolve) => resolve(false)))
+    .finally(() => {
+      saveInFlight = false;
+      if (pendingSave) startNextSave();
+    });
+}
+
+/**
+ * Saves the state to IndexedDB and Supabase. Calls made while an upload is running are merged: only the newest
+ * state is uploaded next, and every waiting caller is resolved once a state at least that new has been saved.
+ */
+export function saveCloudAppState(
   state: CloudAppState,
   userId?: string | null
 ): Promise<boolean> {
-  purgeLegacyProgressOnce();
-  const resolvedUserId = await resolveActiveSupabaseUserId(userId);
-
-  await writeToIdb(state, resolvedUserId);
-
-  // Supabase user_data (user_id, data)
-  if (isSupabaseConfigured && isUuid(resolvedUserId)) {
-    try {
-      const ok = await upsertSupabaseUserData(resolvedUserId, state);
-      if (ok) return true;
-      const lighterState = stripHeavyPdfBase64(state);
-      return await upsertSupabaseUserData(resolvedUserId, lighterState);
-    } catch (err) {
-      console.error('[BLEPPIFY] saveCloudAppState threw:', err);
-      return false;
-    }
-  }
-
-  return true;
+  return new Promise<boolean>((resolve) => {
+    pendingSave = { state, userId };
+    pendingWaiters.push(resolve);
+    if (!saveInFlight) startNextSave();
+  });
 }
 
 /**
