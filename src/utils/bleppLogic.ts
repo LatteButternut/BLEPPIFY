@@ -1297,9 +1297,22 @@ export interface QuizCompletionEvaluation {
   clearedCompetencyIds: string[];
 }
 
-/** Minimum accuracy (and sample size) for a competency to count as "mastered" from quiz evidence. */
+/** Mastery needs BOTH a high score and enough answers behind it, so one lucky answer never counts as mastery. */
 export const COMPETENCY_MASTERY_THRESHOLD_PERCENT = 75;
-export const COMPETENCY_MASTERY_MIN_ITEMS = 2;
+/** Answers needed on a goal before it can be marked mastered. */
+export const COMPETENCY_MASTERY_MIN_ITEMS = 4;
+/** Below this many answers a goal shows only its raw score ("too few answers"), not a mastery tier. */
+export const COMPETENCY_MIN_ANSWERS_FOR_TIER = 3;
+// Mastery is shrunk toward 50% as if every goal started with 4 neutral answers (2 right, 2 wrong):
+// 1/1 -> 60%, 2/2 -> 67%, 4/4 -> 75%, 8/8 -> 83%, 3/6 -> 50%.
+const MASTERY_PRIOR_CORRECT = 2;
+const MASTERY_PRIOR_ATTEMPTS = 4;
+
+/** Confidence-adjusted mastery percentage (null when there are no answers yet). */
+export function adjustedMasteryPercent(correct: number, attempts: number): number | null {
+  if (attempts <= 0) return null;
+  return Math.round(((correct + MASTERY_PRIOR_CORRECT) / (attempts + MASTERY_PRIOR_ATTEMPTS)) * 100);
+}
 
 /** Pulls "1.1"-style competency numbers out of codes like "1.1", "A 1.1" or "Section A 1.1". */
 export function extractCompetencyCode(raw?: string | null): string | null {
@@ -1308,10 +1321,26 @@ export function extractCompetencyCode(raw?: string | null): string | null {
   return m ? `${Number(m[1])}.${Number(m[2])}` : null;
 }
 
+export interface MasteryStat {
+  attempts: number;
+  correct: number;
+  /** Raw accuracy; null when there is no data yet */
+  accuracyPercent: number | null;
+  /** Confidence-adjusted mastery (what the Syllabus shows); null when there is no data yet */
+  masteryPercent: number | null;
+  /** True once there are enough answers to show a mastery tier */
+  hasEnoughData: boolean;
+}
+
+export interface SectionMasteryStat extends MasteryStat {
+  practicedGoals: number;
+  totalGoals: number;
+}
+
 /**
- * Evaluates current Practice Quiz progress. A TOS competency (goal) is auto-cleared only when this quiz gives
- * real evidence: at least COMPETENCY_MASTERY_MIN_ITEMS answered items on it with >= 75% accuracy. Finishing a
- * quiz no longer clears goals by itself; see computeMasteryStats() for the percentages shown in the Syllabus.
+ * Evaluates current Practice Quiz progress. A TOS competency (goal) is auto-cleared only on real evidence:
+ * at least COMPETENCY_MASTERY_MIN_ITEMS saved answers on it AND confidence-adjusted mastery >= 75%, using the
+ * cumulative stats when provided (otherwise only this quiz's answers). Finishing a quiz alone clears nothing.
  */
 export function evaluateQuizCompletionAndSectionGoals(
   displayedQuestions: {
@@ -1327,7 +1356,8 @@ export function evaluateQuizCompletionAndSectionGoals(
     sectionLetter: string;
     title: string;
     competencies: { id: string; code?: string }[];
-  }[]
+  }[],
+  cumulativeByCompetency?: Record<string, { attempts: number; correct: number }>
 ): QuizCompletionEvaluation {
   const totalItems = displayedQuestions.length;
   let answeredCount = 0;
@@ -1377,11 +1407,19 @@ export function evaluateQuizCompletionAndSectionGoals(
         const compCode = extractCompetencyCode(comp.code);
         if (!compCode) continue;
         const compQs = secQs.filter((q) => extractCompetencyCode(q.tosCode) === compCode);
-        if (compQs.length < COMPETENCY_MASTERY_MIN_ITEMS) continue;
-        const compCorrect = compQs.filter(
-          (q) => submittedAnswers[q.id] === q.correctChoice
-        ).length;
-        if ((compCorrect / compQs.length) * 100 >= COMPETENCY_MASTERY_THRESHOLD_PERCENT) {
+        if (compQs.length === 0) continue; // this quiz did not touch the goal
+
+        const evidence =
+          cumulativeByCompetency?.[comp.id] ?? {
+            attempts: compQs.length,
+            correct: compQs.filter((q) => submittedAnswers[q.id] === q.correctChoice).length,
+          };
+        const mastery = adjustedMasteryPercent(evidence.correct, evidence.attempts);
+        if (
+          evidence.attempts >= COMPETENCY_MASTERY_MIN_ITEMS &&
+          mastery !== null &&
+          mastery >= COMPETENCY_MASTERY_THRESHOLD_PERCENT
+        ) {
           clearedHere.push(comp.id);
           clearedCompetencyIdSet.add(comp.id);
         }
@@ -1412,21 +1450,12 @@ export function evaluateQuizCompletionAndSectionGoals(
   };
 }
 
-export interface MasteryStat {
-  attempts: number;
-  correct: number;
-  /** null when there is no data yet */
-  accuracyPercent: number | null;
-}
-
-export interface SectionMasteryStat extends MasteryStat {
-  practicedGoals: number;
-  totalGoals: number;
-}
-
 /**
  * Mastery percentages per section and per subsection (competency), from the latest answer to each question.
- * Items the AI could not tie to a specific competency still count toward their section total.
+ * - A goal's mastery is confidence-adjusted: 1/1 correct is a weak signal (60%), not 100%.
+ * - A section's mastery is the TOS-weighted average of its goals, and goals with no answers count as 0, so
+ *   practicing one goal of several cannot make the whole section look mastered.
+ * - Answers the AI could not tie to a specific goal still count toward a (coverage-scaled) section floor.
  */
 export function computeMasteryStats(
   attemptLogs: QuestionAttemptLog[],
@@ -1434,7 +1463,7 @@ export function computeMasteryStats(
   sections: {
     id: string;
     sectionLetter: string;
-    competencies: { id: string; code?: string }[];
+    competencies: { id: string; code?: string; itemCount?: number }[];
   }[]
 ): {
   bySection: Record<string, SectionMasteryStat>;
@@ -1452,6 +1481,8 @@ export function computeMasteryStats(
     attempts,
     correct,
     accuracyPercent: attempts > 0 ? Math.round((correct / attempts) * 100) : null,
+    masteryPercent: adjustedMasteryPercent(correct, attempts),
+    hasEnoughData: attempts >= COMPETENCY_MIN_ANSWERS_FOR_TIER,
   });
 
   const bySection: Record<string, SectionMasteryStat> = {};
@@ -1461,6 +1492,8 @@ export function computeMasteryStats(
     const secLetter = sec.sectionLetter.trim().toUpperCase();
     const secLogs = logs.filter((l) => normalizeSectionLetter(l.sectionCode, '') === secLetter);
     let practicedGoals = 0;
+    let weightedMastery = 0;
+    let totalWeight = 0;
 
     for (const comp of sec.competencies) {
       const compCode = extractCompetencyCode(comp.code);
@@ -1470,10 +1503,28 @@ export function computeMasteryStats(
       const stat = toStat(compLogs.length, compLogs.filter((l) => l.isCorrect).length);
       byCompetency[comp.id] = stat;
       if (stat.attempts > 0) practicedGoals++;
+
+      const weight = Math.max(1, comp.itemCount ?? 1);
+      totalWeight += weight;
+      weightedMastery += weight * (stat.masteryPercent ?? 0);
     }
 
-    const base = toStat(secLogs.length, secLogs.filter((l) => l.isCorrect).length);
-    bySection[sec.id] = { ...base, practicedGoals, totalGoals: sec.competencies.length };
+    const secCorrect = secLogs.filter((l) => l.isCorrect).length;
+    const base = toStat(secLogs.length, secCorrect);
+    let sectionMastery: number | null = null;
+    if (secLogs.length > 0) {
+      const fromGoals = totalWeight > 0 ? weightedMastery / totalWeight : 0;
+      const coverage = totalWeight > 0 ? Math.min(1, secLogs.length / totalWeight) : 1;
+      const floor = (adjustedMasteryPercent(secCorrect, secLogs.length) ?? 0) * coverage;
+      sectionMastery = Math.round(Math.max(fromGoals, floor));
+    }
+
+    bySection[sec.id] = {
+      ...base,
+      masteryPercent: sectionMastery,
+      practicedGoals,
+      totalGoals: sec.competencies.length,
+    };
   }
 
   return { bySection, byCompetency };
