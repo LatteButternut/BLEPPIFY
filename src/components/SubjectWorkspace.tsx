@@ -2710,6 +2710,25 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
                       ))}
                     </select>
 
+                    {practiceDisplayedQuestions.length > 0 &&
+                      practiceDisplayedQuestions.length < activeQuizSize && (
+                        <button
+                          type="button"
+                          disabled={isGenerating}
+                          onClick={() =>
+                            void handleGeneratePracticeQuiz(practiceScope, activeQuizSize, {
+                              appendToCurrent: true,
+                            })
+                          }
+                          className="inline-flex items-center px-3.5 py-2 border border-[#2E7978] dark:border-[#68C7C5] text-[#2E7978] dark:text-[#68C7C5] hover:bg-[#2E7978]/10 disabled:opacity-50 text-xs font-semibold rounded-lg transition-colors"
+                        >
+                          <span>
+                            Generate {activeQuizSize - practiceDisplayedQuestions.length} more
+                            (keep these {practiceDisplayedQuestions.length})
+                          </span>
+                        </button>
+                      )}
+
                     <button
                       type="button"
                       disabled={isGenerating}
