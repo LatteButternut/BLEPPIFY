@@ -1742,9 +1742,9 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
               {studyMode !== 'flashcards' && studyMode !== 'mock' && (
                 <select
                   aria-label="Select quiz item count"
-                  value={activeQuizSize}
+                  value={getQuizSizeForScope('ALL')}
                   disabled={isGenerating}
-                  onChange={(e) => setQuizSizeForScope(practiceScope, Number(e.target.value))}
+                  onChange={(e) => setQuizSizeForScope('ALL', Number(e.target.value))}
                   className="min-h-[40px] sm:min-h-0 px-2.5 py-1.5 bg-[#F8FAFC] dark:bg-[#1A2942] border border-slate-300 dark:border-[#293D5C] rounded-lg text-xs font-mono font-semibold text-[#0F172A] dark:text-[#E6ECF5] disabled:opacity-50 cursor-pointer shrink-0"
                 >
                   {QUIZ_ITEM_COUNT_OPTIONS.map((cnt) => (
@@ -1763,7 +1763,9 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
                   } else if (studyMode === 'mock') {
                     handleGenerateMockExam100();
                   } else {
-                    handleGeneratePracticeQuiz(practiceScope, activeQuizSize);
+                    // The toolbar button always means the WHOLE subject (all sections by TOS weight),
+                    // never whichever section was generated last.
+                    handleGeneratePracticeQuiz('ALL', getQuizSizeForScope('ALL'));
                   }
                 }}
                 className={`flex-1 sm:flex-initial min-h-[40px] sm:min-h-0 inline-flex items-center justify-center px-3 py-1.5 disabled:opacity-50 text-xs font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 ${
@@ -1779,7 +1781,7 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
                     ? `Generate ${FLASHCARD_DECK_SIZE} Flashcards`
                     : studyMode === 'mock'
                     ? `Generate ${subjectMockSize}-Item Mock`
-                    : `Generate ${activeQuizSize}-Item Quiz`}
+                    : `Generate ${getQuizSizeForScope('ALL')}-Item Quiz`}
                 </span>
               </button>
             </div>
@@ -1920,7 +1922,11 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
                 onClick={() => handleGeneratePracticeQuiz(practiceScope, activeQuizSize)}
                 className="min-h-[38px] sm:min-h-0 inline-flex items-center gap-1.5 px-3 py-1.5 bg-[#0D254C] hover:bg-[#163567] dark:bg-[#234B82] dark:hover:bg-[#2C5B9C] disabled:opacity-50 text-white text-xs font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0"
               >
-                <span>Generate {activeQuizSize}-Item Quiz</span>
+                <span>
+                  Generate {activeQuizSize}-Item{' '}
+                  {activeScopeSection ? `Section ${activeScopeSection.sectionLetter} ` : 'Full Subject '}
+                  Quiz
+                </span>
               </button>
 
               <button
