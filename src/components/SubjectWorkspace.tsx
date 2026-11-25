@@ -156,6 +156,15 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
   const setStudyMode = onStudyModeChange;
 
   const practiceScope = sessionProgress.practice.selectedScope || 'ALL';
+  // Latest answers/selections, readable from inside long-running generation (the closure would be stale)
+  const practiceInteractionRef = useRef<{
+    submitted: Record<string, unknown>;
+    draft: Record<string, unknown>;
+  }>({ submitted: {}, draft: {} });
+  practiceInteractionRef.current = {
+    submitted: (sessionProgress.practice.submittedAnswers || {}) as Record<string, unknown>,
+    draft: (sessionProgress.practice.draftChoices || {}) as Record<string, unknown>,
+  };
   const selectedScope =
     studyMode === 'mock'
       ? sessionProgress.mock.selectedScope || 'ALL'
@@ -930,6 +939,27 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
       }
 
       const acceptedItems: BoardQuestionItem[] = appendMode ? [...existingQuizItems] : [];
+
+      // Full Subject quizzes are truly shuffled: every new item goes to a random position among the items you
+      // have not touched yet. Items you already answered or selected never move. (Section quizzes keep their
+      // easy-to-hard order and "Generate more" simply appends.)
+      const addAcceptedItems = (items: BoardQuestionItem[]) => {
+        if (!isAllScope) {
+          acceptedItems.push(...items);
+          return;
+        }
+        const { submitted, draft } = practiceInteractionRef.current;
+        let lastTouched = -1;
+        acceptedItems.forEach((q, i) => {
+          if (submitted[q.id] || draft[q.id]) lastTouched = i;
+        });
+        const firstMovable = lastTouched + 1;
+        for (const item of items) {
+          const span = acceptedItems.length - firstMovable + 1;
+          const at = firstMovable + Math.floor(Math.random() * span);
+          acceptedItems.splice(at, 0, item);
+        }
+      };
       const fallbackPureMapped: BoardQuestionItem[] = [];
       const runningExcludedStems = [...priorStems];
       let hasCommittedFirstWave = appendMode;
@@ -1067,7 +1097,7 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
             if (uniqueSub.length > 0 && acceptedItems.length < targetQuizSize) {
               const slotsLeft = targetQuizSize - acceptedItems.length;
               const toAdd = uniqueSub.slice(0, slotsLeft);
-              acceptedItems.push(...toAdd);
+              addAcceptedItems(toAdd);
               for (const item of toAdd) {
                 runningExcludedStems.push(item.stem);
               }
@@ -1158,7 +1188,7 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
           // Only add genuinely new items; never pad the quiz with repeats
           const toAdd = extraUnique.slice(0, slotsLeft);
           if (toAdd.length > 0) {
-            acceptedItems.push(...toAdd);
+            addAcceptedItems(toAdd);
             for (const item of toAdd) {
               runningExcludedStems.push(item.stem);
             }
