@@ -44,6 +44,7 @@ import {
   deduplicateQuestions,
   evaluateQuizCompletionAndSectionGoals,
   computeMasteryStats,
+  allocateAllScopeQuotas,
   COMPETENCY_MASTERY_THRESHOLD_PERCENT,
   COMPETENCY_MASTERY_MIN_ITEMS,
   COMPETENCY_MIN_ANSWERS_FOR_TIER,
@@ -745,6 +746,54 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
       subject.sections,
       targetScope
     );
+    const isAllScope = targetScope === 'ALL';
+
+    // Full-Subject quizzes are split across sections by official TOS weight (and by what you have practiced
+    // least), then every section is generated with its own strict section lock.
+    type QuizJobCtx = {
+      title: string;
+      lockedSectionLetter?: string;
+      lockedSectionTitle?: string;
+      excludedSiblingSectionsText: string;
+      domainBoundaryNote: string;
+    };
+    const mainCtx: QuizJobCtx = {
+      title,
+      lockedSectionLetter,
+      lockedSectionTitle,
+      excludedSiblingSectionsText: isolationSpec.excludedSiblingSectionsText || '',
+      domainBoundaryNote: isolationSpec.domainBoundaryNote || '',
+    };
+    const answeredBySection: Record<string, number> = {};
+    for (const sec of subject.sections) {
+      answeredBySection[sec.id] = masteryStats.bySection[sec.id]?.attempts || 0;
+    }
+    const allScopeQuotas: Record<string, number> = isAllScope
+      ? allocateAllScopeQuotas(subject.sections, targetQuizSize, answeredBySection)
+      : {};
+    const sectionCtxFor = (sec: (typeof subject.sections)[number]): QuizJobCtx => {
+      const desc = resolveScopeDescription(sec.id);
+      const iso = buildStrictSectionIsolationSpec(subject.id, subject.sections, sec.id);
+      return {
+        title: desc.title,
+        lockedSectionLetter: desc.lockedSectionLetter,
+        lockedSectionTitle: desc.lockedSectionTitle,
+        excludedSiblingSectionsText: iso.excludedSiblingSectionsText || '',
+        domainBoundaryNote: iso.domainBoundaryNote || '',
+      };
+    };
+    // Competency lines for a section, least-practiced goals first, so new items fill the gaps in your mastery
+    const competencyLinesFor = (sec: (typeof subject.sections)[number], take: number): string => {
+      const ranked = [...sec.competencies].sort(
+        (a, b) =>
+          (masteryStats.byCompetency[a.id]?.attempts || 0) -
+            (masteryStats.byCompetency[b.id]?.attempts || 0) || b.itemCount - a.itemCount
+      );
+      return ranked
+        .slice(0, Math.max(1, take))
+        .map((c) => `[${c.code}] ${c.description} (${c.bloomsBreakdown})`)
+        .join('\n');
+    };
 
     const currentRunNonce = ++quizRunNonceRef.current;
     setIsGenerating(true);
@@ -778,6 +827,8 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
     setGenBanner(
       appendMode
         ? `Generating the remaining ${Math.max(0, targetQuizSize - existingQuizItems.length)} quiz items — your current questions and answers are kept...`
+        : isAllScope
+        ? `Generating ${targetQuizSize}-item Full Subject Quiz — items are distributed across all sections by official TOS weight...`
         : `Generating ${targetQuizSize}-item ${
         lockedSectionLetter
           ? `Section ${lockedSectionLetter} (${lockedSectionTitle}) `
@@ -795,9 +846,20 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
       );
 
       const pdfRefs = await preparePdfRefsForApi();
-      const subBatches = appendMode
-        ? []
-        : buildPracticeQuizParallelBatches(
+      type QuizJob = {
+        ctx: QuizJobCtx;
+        batch: {
+          batchIndex: number;
+          count: number;
+          competencySubsetText: string;
+          batchFocusHint?: string;
+        };
+      };
+
+      let jobs: QuizJob[] = [];
+      if (!isAllScope) {
+        if (!appendMode) {
+          jobs = buildPracticeQuizParallelBatches(
             details,
             difficultyFilter,
             targetQuizSize,
@@ -808,7 +870,64 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
                   sectionTitle: lockedSectionTitle || title,
                 }
               : undefined
-          );
+          ).map((batch) => ({ ctx: mainCtx, batch }));
+        }
+      } else {
+        // How many items each section still needs (existing items count when topping up an existing quiz)
+        const existingBySection: Record<string, number> = {};
+        for (const q of existingQuizItems) {
+          const letter = String(q.sectionCode || '').trim().toUpperCase();
+          existingBySection[letter] = (existingBySection[letter] || 0) + 1;
+        }
+        const need: Record<string, number> = {};
+        let needTotal = 0;
+        for (const sec of subject.sections) {
+          const have = existingBySection[sec.sectionLetter.trim().toUpperCase()] || 0;
+          need[sec.id] = Math.max(0, (allScopeQuotas[sec.id] || 0) - have);
+          needTotal += need[sec.id];
+        }
+        const missingTotal = targetQuizSize - existingQuizItems.length;
+        while (needTotal < missingTotal && subject.sections.length > 0) {
+          const next = [...subject.sections].sort(
+            (x, y) =>
+              (allScopeQuotas[y.id] || 0) - (existingBySection[y.sectionLetter.toUpperCase()] || 0) -
+                need[y.id] -
+                ((allScopeQuotas[x.id] || 0) - (existingBySection[x.sectionLetter.toUpperCase()] || 0) - need[x.id])
+          )[0];
+          need[next.id] += 1;
+          needTotal += 1;
+        }
+
+        let batchIndex = 1;
+        const perSectionJobs: QuizJob[][] = [];
+        for (const sec of subject.sections) {
+          const qty = need[sec.id] || 0;
+          if (qty <= 0) continue;
+          const ctx = sectionCtxFor(sec);
+          const chunkCount = Math.ceil(qty / 6);
+          const secJobs: QuizJob[] = [];
+          let remaining = qty;
+          for (let i = 0; i < chunkCount; i++) {
+            const size = Math.ceil(remaining / (chunkCount - i));
+            remaining -= size;
+            secJobs.push({
+              ctx,
+              batch: {
+                batchIndex: batchIndex++,
+                count: size,
+                competencySubsetText: competencyLinesFor(sec, Math.max(size, 2)),
+                batchFocusHint: `Full Subject quiz: write exactly ${size} item(s) for Section ${sec.sectionLetter} only. Put each item on a DIFFERENT competency from the list (one item per listed competency when possible) and follow the Bloom's level named in each competency.`,
+              },
+            });
+          }
+          perSectionJobs.push(secJobs);
+        }
+        // Interleave sections so the first results already cover several sections
+        const longest = Math.max(0, ...perSectionJobs.map((list) => list.length));
+        for (let i = 0; i < longest; i++) {
+          for (const list of perSectionJobs) if (list[i]) jobs.push(list[i]);
+        }
+      }
 
       const acceptedItems: BoardQuestionItem[] = appendMode ? [...existingQuizItems] : [];
       const fallbackPureMapped: BoardQuestionItem[] = [];
@@ -855,8 +974,10 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
 
       const mapAndVerifyPureBatch = (
         rawItems: any[],
-        offsetBase: number
+        offsetBase: number,
+        jobCtx: QuizJobCtx = mainCtx
       ): BoardQuestionItem[] => {
+        const jobLockedLetter = jobCtx.lockedSectionLetter;
         // Preserve honest model sectionCode first so off-section items can be detected before locking
         const prelimMapped = rawItems.map((q: any, idx: number) =>
           mapRawQuestion(
@@ -865,23 +986,23 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
               sectionCode:
                 typeof q?.sectionCode === 'string' && q.sectionCode.trim()
                   ? q.sectionCode
-                  : lockedSectionLetter || 'A',
+                  : jobLockedLetter || 'A',
             },
             offsetBase + idx,
-            title
+            jobCtx.title
           )
         );
 
         const pureOnly = filterPureLockedSectionQuestions(
           prelimMapped,
           subject.id,
-          lockedSectionLetter
+          jobLockedLetter
         );
 
-        return lockedSectionLetter
+        return jobLockedLetter
           ? pureOnly.map((item) => ({
               ...item,
-              sectionCode: lockedSectionLetter.trim().toUpperCase(),
+              sectionCode: jobLockedLetter.trim().toUpperCase(),
             }))
           : pureOnly;
       };
@@ -892,27 +1013,29 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
       let nextSubBatchCursor = 0;
 
       const runSubBatchWorker = async () => {
-        while (nextSubBatchCursor < subBatches.length) {
+        while (nextSubBatchCursor < jobs.length) {
           if (
             quizRunNonceRef.current !== currentRunNonce ||
             acceptedItems.length >= targetQuizSize
           ) {
             return;
           }
-          const subBatch = subBatches[nextSubBatchCursor++];
+          const job = jobs[nextSubBatchCursor++];
+          const subBatch = job.batch;
+          const jobCtx = job.ctx;
           try {
             const res = await postGeminiJsonWithPdfRetry(
               '/api/gemini/questions',
               {
                 subjectTitle: subject.fullTitle,
-                scopeTitle: title,
+                scopeTitle: jobCtx.title,
                 competencyDetails: subBatch.competencySubsetText,
                 count: subBatch.count,
                 difficultyFilter,
-                lockedSectionLetter,
-                lockedSectionTitle,
-                excludedSectionsDetails: isolationSpec.excludedSiblingSectionsText || '',
-                domainBoundaryNote: isolationSpec.domainBoundaryNote || '',
+                lockedSectionLetter: jobCtx.lockedSectionLetter,
+                lockedSectionTitle: jobCtx.lockedSectionTitle,
+                excludedSectionsDetails: jobCtx.excludedSiblingSectionsText,
+                domainBoundaryNote: jobCtx.domainBoundaryNote,
                 batchFocusHint: subBatch.batchFocusHint,
                 excludeStems: runningExcludedStems.slice(-25),
                 excludeAnswers: acceptedItems
@@ -936,7 +1059,7 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
 
             const data = await res.json();
             const rawItems = Array.isArray(data.questions) ? data.questions : [];
-            const pureSub = mapAndVerifyPureBatch(rawItems, subBatch.batchIndex * 20);
+            const pureSub = mapAndVerifyPureBatch(rawItems, subBatch.batchIndex * 20, jobCtx);
 
             fallbackPureMapped.push(...pureSub);
             const uniqueSub = deduplicateQuestions(pureSub, runningExcludedStems, acceptedItems);
@@ -958,7 +1081,7 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
 
       await Promise.all(
         Array.from(
-          { length: Math.min(CONCURRENCY_LIMIT, subBatches.length) },
+          { length: Math.min(CONCURRENCY_LIMIT, jobs.length) },
           () => runSubBatchWorker()
         )
       );
@@ -972,19 +1095,42 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
         topUpAttempt++
       ) {
         const needed = targetQuizSize - acceptedItems.length;
-        const topUpCount = Math.min(appendMode ? 8 : 10, needed + 2);
+        let topUpCtx: QuizJobCtx = mainCtx;
+        let topUpDetails = details;
+        let topUpCount = Math.min(appendMode ? 8 : 10, needed + 2);
+        if (isAllScope) {
+          const haveBySection: Record<string, number> = {};
+          for (const q of acceptedItems) {
+            const letter = String(q.sectionCode || '').trim().toUpperCase();
+            haveBySection[letter] = (haveBySection[letter] || 0) + 1;
+          }
+          const neediest = [...subject.sections].sort(
+            (x, y) =>
+              (allScopeQuotas[y.id] || 0) - (haveBySection[y.sectionLetter.toUpperCase()] || 0) -
+              ((allScopeQuotas[x.id] || 0) - (haveBySection[x.sectionLetter.toUpperCase()] || 0))
+          )[0];
+          if (neediest) {
+            const gap = Math.max(
+              1,
+              (allScopeQuotas[neediest.id] || 0) - (haveBySection[neediest.sectionLetter.toUpperCase()] || 0)
+            );
+            topUpCtx = sectionCtxFor(neediest);
+            topUpDetails = competencyLinesFor(neediest, Math.max(gap, 2));
+            topUpCount = Math.min(6, gap + 1);
+          }
+        }
         const topUpRes = await postGeminiJsonWithPdfRetry(
           '/api/gemini/questions',
           {
             subjectTitle: subject.fullTitle,
-            scopeTitle: title,
-            competencyDetails: details,
+            scopeTitle: topUpCtx.title,
+            competencyDetails: topUpDetails,
             count: topUpCount,
             difficultyFilter,
-            lockedSectionLetter,
-            lockedSectionTitle,
-            excludedSectionsDetails: isolationSpec.excludedSiblingSectionsText || '',
-            domainBoundaryNote: isolationSpec.domainBoundaryNote || '',
+            lockedSectionLetter: topUpCtx.lockedSectionLetter,
+            lockedSectionTitle: topUpCtx.lockedSectionTitle,
+            excludedSectionsDetails: topUpCtx.excludedSiblingSectionsText,
+            domainBoundaryNote: topUpCtx.domainBoundaryNote,
             excludeStems: runningExcludedStems.slice(-25),
             excludeAnswers: acceptedItems
               .map((q) => q.options?.[q.correctChoice] || '')
@@ -1003,7 +1149,8 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
         if (Array.isArray(topUpData.questions)) {
           const topUpPure = mapAndVerifyPureBatch(
             topUpData.questions,
-            500 + topUpAttempt * 50
+            500 + topUpAttempt * 50,
+            topUpCtx
           );
           fallbackPureMapped.push(...topUpPure);
           const extraUnique = deduplicateQuestions(topUpPure, runningExcludedStems, acceptedItems);
