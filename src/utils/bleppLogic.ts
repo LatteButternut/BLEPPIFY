@@ -1276,6 +1276,69 @@ export function buildMockExamSectionBatches(
   return batches;
 }
 
+/**
+ * Splits a Full-Subject quiz across sections by official TOS weight (largest-remainder rounding).
+ * - Ties and leftover items go to the sections you have practiced least (answeredBySection).
+ * - When the quiz is large enough, every section gets at least one item.
+ * - When it is smaller than the number of sections, the least-practiced, heaviest sections are chosen.
+ */
+export function allocateAllScopeQuotas(
+  sections: { id: string; weightPercent: number }[],
+  totalItems: number,
+  answeredBySection: Record<string, number> = {}
+): Record<string, number> {
+  const quotas: Record<string, number> = {};
+  for (const sec of sections) quotas[sec.id] = 0;
+  if (sections.length === 0 || totalItems <= 0) return quotas;
+
+  const totalWeight = sections.reduce((a, sec) => a + Math.max(0, sec.weightPercent), 0) || sections.length;
+  const totalAnswered = sections.reduce((a, sec) => a + (answeredBySection[sec.id] || 0), 0);
+  const rows = sections.map((sec) => {
+    const share = (Math.max(0, sec.weightPercent) || 1) / totalWeight;
+    const exact = share * totalItems;
+    const answered = answeredBySection[sec.id] || 0;
+    return {
+      sec,
+      share,
+      floored: Math.floor(exact),
+      remainder: exact - Math.floor(exact),
+      // positive = this section is under-practiced relative to its exam weight
+      deficit: share * (totalAnswered + totalItems) - answered,
+    };
+  });
+
+  if (totalItems < sections.length) {
+    const picked = [...rows]
+      .sort((a, b) => b.deficit - a.deficit || b.share - a.share)
+      .slice(0, totalItems);
+    for (const row of picked) quotas[row.sec.id] = 1;
+    return quotas;
+  }
+
+  let allocated = rows.reduce((sum, r) => sum + r.floored, 0);
+  for (const r of rows) quotas[r.sec.id] = r.floored;
+  const order = [...rows].sort((a, b) => b.remainder - a.remainder || b.deficit - a.deficit);
+  let idx = 0;
+  while (allocated < totalItems) {
+    quotas[order[idx % order.length].sec.id] += 1;
+    allocated += 1;
+    idx += 1;
+  }
+
+  // Every section gets at least one item: take it from the largest quota (preferring the most-practiced one)
+  for (const r of [...rows].sort((a, b) => b.deficit - a.deficit)) {
+    if (quotas[r.sec.id] > 0) continue;
+    const donor = [...rows]
+      .filter((d) => quotas[d.sec.id] > 1)
+      .sort((a, b) => quotas[b.sec.id] - quotas[a.sec.id] || a.deficit - b.deficit)[0];
+    if (!donor) break;
+    quotas[donor.sec.id] -= 1;
+    quotas[r.sec.id] += 1;
+  }
+
+  return quotas;
+}
+
 export interface QuizCompletionEvaluation {
   totalItems: number;
   answeredCount: number;
