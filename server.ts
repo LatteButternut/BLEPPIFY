@@ -199,7 +199,7 @@ const EXCERPT_STOPWORDS = new Set([
 ]);
 
 /** Picks the PDF passages that best match the requested competencies so the prompt stays small. */
-function selectPdfExcerpts(text: string, query: string, maxChars: number): string {
+function selectPdfExcerpts(text: string, query: string, maxChars: number, avoid = ''): string {
   const clean = text.replace(/\s+/g, ' ').trim();
   if (!clean) return '';
   if (clean.length <= maxChars) return clean;
@@ -229,6 +229,18 @@ function selectPdfExcerpts(text: string, query: string, maxChars: number): strin
     }
   }
 
+  // Each request should draw on DIFFERENT passages: passages about facts that earlier items already covered are
+  // penalized, and a little randomness breaks ties so repeated calls don't all anchor on the same paragraph.
+  const avoidTerms = new Set((avoid.toLowerCase().match(/[a-z]{5,}/g) || []).map((w) => w.slice(0, 6)));
+  if (avoidTerms.size > 0 || terms.length > 0) {
+    for (const chunk of chunks) {
+      let hits = 0;
+      for (const w of new Set((chunk.text.toLowerCase().match(/[a-z]{5,}/g) || []).map((x) => x.slice(0, 6)))) {
+        if (avoidTerms.has(w)) hits++;
+      }
+      chunk.score = chunk.score - Math.min(6, hits * 0.35) + Math.random() * 1.5;
+    }
+  }
   const ranked = [...chunks].sort((a, b) => b.score - a.score || a.idx - b.idx);
   const picked: typeof chunks = [];
   let used = 0;
@@ -245,7 +257,8 @@ function selectPdfExcerpts(text: string, query: string, maxChars: number): strin
 async function resolvePdfParts(
   ai: AiClient,
   pdfFiles: Array<{ id?: string; name?: string; mimeType?: string; base64Data?: string }>,
-  query = ''
+  query = '',
+  avoid = ''
 ): Promise<{ parts: PartInput[]; missingIds: string[] }> {
   if (!Array.isArray(pdfFiles) || pdfFiles.length === 0) {
     return { parts: [], missingIds: [] };
@@ -297,7 +310,7 @@ async function resolvePdfParts(
     const excerpts: string[] = [];
     for (const entry of resolvedEntries) {
       const fullText = await extractPdfText(entry.base64Data);
-      const excerpt = selectPdfExcerpts(fullText, query, perPdfBudget);
+      const excerpt = selectPdfExcerpts(fullText, query, perPdfBudget, avoid);
       if (excerpt) excerpts.push(excerpt);
     }
     if (excerpts.length === 0) {
@@ -1001,6 +1014,156 @@ function optionTokenSet(options: Record<string, unknown> | undefined): Set<strin
   return new Set(text.match(/[a-z]{4,}/g) || []);
 }
 
+// ----------------------------------------------------------------------------
+// Repeat / consistency guards for generated items
+// ----------------------------------------------------------------------------
+const TOPIC_SKIP_WORDS = new Set([
+  'that', 'this', 'with', 'from', 'which', 'what', 'when', 'where', 'their', 'there', 'these', 'those',
+  'best', 'most', 'following', 'would', 'could', 'should', 'because', 'about', 'into', 'than', 'have',
+  'according', 'statement', 'describes', 'explains', 'example', 'illustrates', 'refers', 'related',
+  'between', 'typically', 'common', 'often', 'more', 'also', 'such', 'each', 'both', 'only',
+]);
+
+/** Rough word stems (first 6 letters), so "industrialized" and "industrialization" count as the same topic word. */
+function topicTokens(text: string): Set<string> {
+  const out = new Set<string>();
+  for (const w of String(text || '').toLowerCase().match(/[a-z]{4,}/g) || []) {
+    if (TOPIC_SKIP_WORDS.has(w)) continue;
+    out.add(w.slice(0, 6));
+  }
+  return out;
+}
+
+function topicOverlap(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 || b.size === 0) return 0;
+  let inter = 0;
+  for (const t of a) if (b.has(t)) inter++;
+  const union = a.size + b.size - inter;
+  return union > 0 ? inter / union : 0;
+}
+
+/**
+ * Drops new items that repeat something already in the quiz (stem, keyed answer or focus concept).
+ * The client sends what earlier batches produced, so this also protects top-ups and "Generate more".
+ */
+const GENERIC_TOPIC_STEMS = new Set([
+  'develo', 'theory', 'theori', 'stage', 'psycho', 'disord', 'behavi', 'proces', 'person', 'indivi',
+  'childr', 'change', 'factor', 'relati', 'influe', 'learni', 'social', 'cultur', 'enviro', 'biolog',
+  'geneti', 'cognit', 'emotio', 'physic', 'adoles', 'human', 'studen', 'people', 'peopl',
+]);
+
+/** Max number of items in one quiz that may be keyed to the same distinctive word (e.g. "industrialization"). */
+const MAX_ITEMS_PER_KEYED_WORD = 3;
+
+function distinctiveKeyTokens(keyText: string, scopeTokens: Set<string>): string[] {
+  return Array.from(topicTokens(keyText)).filter(
+    (t) => !scopeTokens.has(t) && !GENERIC_TOPIC_STEMS.has(t)
+  );
+}
+
+function dropRepeatsOfExcluded(
+  items: Array<Record<string, unknown>>,
+  excludeStems: unknown[],
+  excludeAnswers: unknown[],
+  excludeConcepts: unknown[],
+  scopeText = ''
+): Array<Record<string, unknown>> {
+  const stemSets = (Array.isArray(excludeStems) ? excludeStems : []).map((x) => topicTokens(String(x)));
+  const scopeTokensForAnswers = topicTokens(scopeText);
+  const answerDistinctSets = (Array.isArray(excludeAnswers) ? excludeAnswers : []).map(
+    (x) => new Set(distinctiveKeyTokens(String(x), scopeTokensForAnswers))
+  );
+  const conceptSets = (Array.isArray(excludeConcepts) ? excludeConcepts : []).map((x) => topicTokens(String(x)));
+  const scopeTokens = topicTokens(scopeText);
+  const keyWordCounts = new Map<string, number>();
+  for (const a of Array.isArray(excludeAnswers) ? excludeAnswers : []) {
+    for (const t of distinctiveKeyTokens(String(a), scopeTokens)) {
+      keyWordCounts.set(t, (keyWordCounts.get(t) || 0) + 1);
+    }
+  }
+
+  return items.filter((item) => {
+    const options = item.options as Record<string, string> | undefined;
+    const keyText = options ? String(options[String(item.correctChoice)] ?? '') : '';
+    const stemTokens = topicTokens(String(item.stem ?? ''));
+    const conceptTokens = topicTokens(String(item.focusConcept ?? ''));
+    // Same keyed idea = the keyed answers share at least 3 distinctive words (not scope or generic words)
+    const keyDistinctive = distinctiveKeyTokens(keyText, scopeTokens);
+    if (
+      keyDistinctive.length >= 3 &&
+      answerDistinctSets.some((set) => keyDistinctive.filter((t) => set.has(t)).length >= 3)
+    ) {
+      return false;
+    }
+    if (conceptTokens.size >= 2 && conceptSets.some((c) => c.size >= 2 && topicOverlap(conceptTokens, c) >= 0.7)) return false;
+    if (stemTokens.size >= 5 && stemSets.some((st) => st.size >= 5 && topicOverlap(stemTokens, st) >= 0.6)) return false;
+
+    // No more than two items per quiz may be keyed to the same distinctive word
+    const distinctive = distinctiveKeyTokens(keyText, scopeTokens);
+    if (distinctive.some((t) => (keyWordCounts.get(t) || 0) >= MAX_ITEMS_PER_KEYED_WORD)) return false;
+    for (const t of distinctive) keyWordCounts.set(t, (keyWordCounts.get(t) || 0) + 1);
+    return true;
+  });
+}
+
+/** Maps labels like "Remember/Understand" or "Comprehension" onto the six Bloom's levels the app understands. */
+function normalizeBloomsLevel(item: Record<string, unknown>): Record<string, unknown> {
+  const raw = String(item.bloomsLevel ?? '').toLowerCase();
+  const first = raw.split(/[\/,&]|\band\b/)[0] || raw;
+  let level = '';
+  if (/remember|recall|knowledge/.test(first)) level = 'Remembering';
+  else if (/understand|comprehen/.test(first)) level = 'Understanding';
+  else if (/appl/.test(first)) level = 'Applying';
+  else if (/analy/.test(first)) level = 'Analyzing';
+  else if (/evaluat|judg|assess/.test(first)) level = 'Evaluating';
+  else if (/creat|synthes|design/.test(first)) level = 'Creating';
+  return level ? { ...item, bloomsLevel: level } : item;
+}
+
+/**
+ * If the model's explanations clearly say a different option is correct (e.g. "... (CORRECT)" in the exam tip or a
+ * rationale starting with "Correct"), trust the explanations over a mismatched key. Also strips "(CORRECT)" markers.
+ */
+function reconcileAnswerKey(item: Record<string, unknown>): Record<string, unknown> {
+  const options = item.options as Record<string, string> | undefined;
+  const rationales = (item.optionRationales || {}) as Record<string, string>;
+  const key = String(item.correctChoice);
+  if (!options) return item;
+
+  const votes = new Set<string>();
+  for (const l of OPTION_LETTERS) {
+    if (/^\s*\(?correct\b/i.test(String(rationales[l] ?? ''))) votes.add(l);
+  }
+  const tip = String(item.examTip ?? '').toLowerCase();
+  for (const l of OPTION_LETTERS) {
+    const text = String(options[l] ?? '').toLowerCase().replace(/[.\s]+$/, '');
+    if (text.length >= 12 && tip.includes(`${text}`) && /\(correct\)/.test(tip)) {
+      const at = tip.indexOf(text) + text.length;
+      if (/^[.\s]*\(correct\)/.test(tip.slice(at, at + 14))) votes.add(l);
+    }
+  }
+
+  const clean = (v: unknown): string => String(v ?? '').replace(/\s*\((?:in)?correct\)\.?/gi, '');
+  const cleanedRationales: Record<string, string> = {};
+  for (const l of OPTION_LETTERS) {
+    if (rationales[l] !== undefined) cleanedRationales[l] = clean(rationales[l]);
+  }
+  const cleaned: Record<string, unknown> = {
+    ...item,
+    ...(typeof item.examTip === 'string' ? { examTip: clean(item.examTip) } : {}),
+    ...(item.optionRationales ? { optionRationales: cleanedRationales } : {}),
+  };
+
+  if (votes.size === 1) {
+    const [only] = Array.from(votes);
+    if (only !== key) {
+      console.warn(`[BLEPPIFY] fixed a mismatched answer key (${key} -> ${only}) from the item's own explanations`);
+      return { ...cleaned, correctChoice: only };
+    }
+  }
+  return cleaned;
+}
+
 const GIVEAWAY_SKIP_WORDS = new Set([
   'that', 'this', 'with', 'from', 'which', 'what', 'when', 'where', 'their', 'there', 'these', 'those',
   'best', 'most', 'following', 'would', 'could', 'should', 'because', 'about', 'into', 'than', 'have',
@@ -1181,7 +1344,12 @@ app.post('/api/gemini/questions', async (req, res) => {
     const { parts: pdfParts, missingIds } = await resolvePdfParts(
       ai,
       pdfFiles,
-      `${scopeTitle || ''} ${lockedSectionTitle || ''} ${competencyDetails || ''} ${batchFocusHint || ''}`
+      `${scopeTitle || ''} ${lockedSectionTitle || ''} ${competencyDetails || ''} ${batchFocusHint || ''}`,
+      [
+        ...(Array.isArray(excludeStems) ? excludeStems.slice(-25) : []),
+        ...(Array.isArray(excludeAnswers) ? excludeAnswers.slice(-25) : []),
+        ...(Array.isArray(excludeConcepts) ? excludeConcepts.slice(-30) : []),
+      ].join(' ')
     );
     if (missingIds.length > 0) {
       res.status(409).json({ error: 'PDF cache miss', code: 'PDF_CACHE_MISS', missingIds });
@@ -1270,7 +1438,9 @@ Every item MUST present a 100% fresh angle, scenario, and mutually distinct conc
 - Every item must be keyed to a DIFFERENT concept. Never write two items whose correct answer says the same thing with only the character's name or age changed.
 - Never reuse the same set of four options across items. Distractors must be written fresh for each stem, drawn from different related concepts in scope — not a fixed template such as "normal phase / abnormal behavior / cultural practice / temporary reaction".
 - Vary the item format across the batch: some direct concept questions, some short vignettes, some "which of the following is NOT...", some comparisons. Vary the setting, age, gender, and Filipino context in vignettes.
-- Spread the correct answer across A, B, C and D; do not favor any one letter.${answerExclusionBlock}`;
+- Spread the correct answer across A, B, C and D; do not favor any one letter.
+- Questions must stand on their own: NEVER write "according to the passage / excerpt / reviewer / PDF / document / text", and never mention "the stem". Ask the question directly.
+- If reference excerpts are provided, use each passage or fact for at most ONE item; do not write several items about the same fact (for example the definition or origin of one concept).${answerExclusionBlock}`;
 
     const accuracyDirective = `\nACCURACY SELF-CHECK (do this silently for EVERY item before you finish it; a wrong key is the worst possible error):
 - Re-read the stem and list every detail that rules options in or out. Example: if twins are "raised apart" in different environments, an explanation that depends on a shared rearing home (such as passive gene–environment correlation) cannot be the answer.
@@ -1400,8 +1570,18 @@ IMPORTANT: NEVER mention "Section A/B/C/D/E/F" or TOS code numbers inside stem, 
     const rawText = (response.text ?? '[]').trim();
     const parsedQuestions = JSON.parse(rawText);
     const variedQuestions = Array.isArray(parsedQuestions)
-      ? dropNearIdenticalOptionSets(parsedQuestions as Array<Record<string, unknown>>)
+      ? dropNearIdenticalOptionSets(
+          dropRepeatsOfExcluded(
+            parsedQuestions as Array<Record<string, unknown>>,
+            excludeStems,
+            excludeAnswers,
+            excludeConcepts,
+            `${scopeTitle || ''} ${lockedSectionTitle || ''} ${competencyDetails || ''}`
+          )
+        )
+          .map(normalizeBloomsLevel)
           .map(relabelGiveawayItem)
+          .map(reconcileAnswerKey)
           .map(shuffleQuestionOptions)
       : [];
     const questions = Array.isArray(variedQuestions)
