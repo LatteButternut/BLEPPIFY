@@ -1092,7 +1092,12 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
             const pureSub = mapAndVerifyPureBatch(rawItems, subBatch.batchIndex * 20, jobCtx);
 
             fallbackPureMapped.push(...pureSub);
-            const uniqueSub = deduplicateQuestions(pureSub, runningExcludedStems, acceptedItems);
+            const uniqueSub = deduplicateQuestions(
+              pureSub,
+              runningExcludedStems,
+              acceptedItems,
+              `${jobCtx.title} ${subBatch.competencySubsetText}`
+            );
 
             if (uniqueSub.length > 0 && acceptedItems.length < targetQuizSize) {
               const slotsLeft = targetQuizSize - acceptedItems.length;
@@ -1183,7 +1188,12 @@ export const SubjectWorkspace: React.FC<SubjectWorkspaceProps> = ({
             topUpCtx
           );
           fallbackPureMapped.push(...topUpPure);
-          const extraUnique = deduplicateQuestions(topUpPure, runningExcludedStems, acceptedItems);
+          const extraUnique = deduplicateQuestions(
+            topUpPure,
+            runningExcludedStems,
+            acceptedItems,
+            `${topUpCtx.title} ${topUpDetails}`
+          );
           const slotsLeft = targetQuizSize - acceptedItems.length;
           // Only add genuinely new items; never pad the quiz with repeats
           const toAdd = extraUnique.slice(0, slotsLeft);
