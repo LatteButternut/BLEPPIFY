@@ -1162,32 +1162,117 @@ export function areOptionSetsTooSimilar(
   return union > 0 && intersection / union >= 0.6;
 }
 
+const TOPIC_SKIP_WORDS = new Set([
+  'that', 'this', 'with', 'from', 'which', 'what', 'when', 'where', 'their', 'there', 'these', 'those',
+  'best', 'most', 'following', 'would', 'could', 'should', 'because', 'about', 'into', 'than', 'have',
+  'according', 'statement', 'describes', 'explains', 'example', 'illustrates', 'refers', 'related',
+  'between', 'typically', 'common', 'often', 'more', 'also', 'such', 'each', 'both', 'only',
+]);
+
+/** Rough word stems (first 6 letters), so "industrialized" and "industrialization" count as one topic word. */
+function topicTokenSet(text: string | undefined): Set<string> {
+  const out = new Set<string>();
+  for (const w of String(text || '').toLowerCase().match(/[a-z]{4,}/g) || []) {
+    if (TOPIC_SKIP_WORDS.has(w)) continue;
+    out.add(w.slice(0, 6));
+  }
+  return out;
+}
+
+function topicOverlapRatio(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 || b.size === 0) return 0;
+  let inter = 0;
+  for (const t of a) if (b.has(t)) inter++;
+  const union = a.size + b.size - inter;
+  return union > 0 ? inter / union : 0;
+}
+
+const GENERIC_TOPIC_STEMS = new Set([
+  'develo', 'theory', 'theori', 'stage', 'psycho', 'disord', 'behavi', 'proces', 'person', 'indivi',
+  'childr', 'change', 'factor', 'relati', 'influe', 'learni', 'social', 'cultur', 'enviro', 'biolog',
+  'geneti', 'cognit', 'emotio', 'physic', 'adoles', 'human', 'studen', 'people', 'peopl',
+]);
+
+/** Max number of items in one quiz that may be keyed to the same distinctive word (e.g. "industrialization"). */
+export const MAX_ITEMS_PER_KEYED_WORD = 3;
+
+function distinctiveKeyTokens(keyText: string | undefined, scopeTokens: Set<string>): string[] {
+  return Array.from(topicTokenSet(keyText)).filter(
+    (t) => !scopeTokens.has(t) && !GENERIC_TOPIC_STEMS.has(t)
+  );
+}
+
+type DedupableQuestion = {
+  stem: string;
+  options?: Partial<Record<'A' | 'B' | 'C' | 'D', string>>;
+  correctChoice?: 'A' | 'B' | 'C' | 'D';
+  focusConcept?: string;
+};
+
 /**
- * Removes any incoming questions whose stems repeat or closely paraphrase
- * previously seen stems or earlier items in the same incoming batch. When the
- * already-accepted items are passed in, items that reuse almost the same four
- * options as an earlier item are removed too.
+ * True when two items test the same idea even if the wording differs: their keyed answers share at least 3
+ * distinctive words (scope and generic words ignored), or their focus concepts are nearly the same.
  */
-export function deduplicateQuestions<
-  T extends { stem: string; options?: Partial<Record<'A' | 'B' | 'C' | 'D', string>> }
->(
+export function areQuestionsSameIdea(
+  a: DedupableQuestion,
+  b: DedupableQuestion,
+  scopeTokens: Set<string> = new Set()
+): boolean {
+  const keyA = a.options && a.correctChoice ? a.options[a.correctChoice] : undefined;
+  const keyB = b.options && b.correctChoice ? b.options[b.correctChoice] : undefined;
+  const distinctA = distinctiveKeyTokens(keyA, scopeTokens);
+  const setB = new Set(distinctiveKeyTokens(keyB, scopeTokens));
+  if (distinctA.length >= 3 && distinctA.filter((t) => setB.has(t)).length >= 3) {
+    return true;
+  }
+  const conceptA = topicTokenSet(a.focusConcept);
+  const conceptB = topicTokenSet(b.focusConcept);
+  if (conceptA.size >= 2 && conceptB.size >= 2 && topicOverlapRatio(conceptA, conceptB) >= 0.7) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Removes any incoming questions that repeat or closely paraphrase previously seen stems or earlier items.
+ * When the already-accepted items are passed in, items are also removed if they reuse almost the same four
+ * options, the same keyed-answer idea, or the same focus concept as an earlier item.
+ */
+export function deduplicateQuestions<T extends DedupableQuestion>(
   incoming: T[],
   existingStems: string[],
-  existingItems: Array<{ options?: Partial<Record<'A' | 'B' | 'C' | 'D', string>> }> = []
+  existingItems: DedupableQuestion[] = [],
+  scopeText = ''
 ): T[] {
   const accepted: T[] = [];
   const referenceStems = [...existingStems];
-  const referenceOptionSets = existingItems.map((q) => q.options);
+  const referenceItems: DedupableQuestion[] = [...existingItems];
+  const scopeTokens = topicTokenSet(scopeText);
+  const keyWordCounts = new Map<string, number>();
+  const keyTextOf = (q: DedupableQuestion) =>
+    q.options && q.correctChoice ? q.options[q.correctChoice] : undefined;
+  for (const prev of existingItems) {
+    for (const t of distinctiveKeyTokens(keyTextOf(prev), scopeTokens)) {
+      keyWordCounts.set(t, (keyWordCounts.get(t) || 0) + 1);
+    }
+  }
 
   for (const item of incoming) {
     if (!item?.stem || !item.stem.trim()) continue;
     const isDup =
       referenceStems.some((prevStem) => areStemsTooSimilar(item.stem, prevStem)) ||
-      referenceOptionSets.some((prevOptions) => areOptionSetsTooSimilar(item.options, prevOptions));
-    if (!isDup) {
+      referenceItems.some(
+        (prev) =>
+          areOptionSetsTooSimilar(item.options, prev.options) ||
+          areQuestionsSameIdea(item, prev, scopeTokens)
+      );
+    const distinctive = distinctiveKeyTokens(keyTextOf(item), scopeTokens);
+    const overUsed = distinctive.some((t) => (keyWordCounts.get(t) || 0) >= MAX_ITEMS_PER_KEYED_WORD);
+    if (!isDup && !overUsed) {
       accepted.push(item);
       referenceStems.push(item.stem);
-      referenceOptionSets.push(item.options);
+      referenceItems.push(item);
+      for (const t of distinctive) keyWordCounts.set(t, (keyWordCounts.get(t) || 0) + 1);
     }
   }
 
